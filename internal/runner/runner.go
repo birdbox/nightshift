@@ -1,16 +1,19 @@
 // Package runner orchestrates execution of a single issue: it creates an
 // isolated git worktree, runs Claude Code inside it, and tears the worktree
-// down afterward.
+// down afterward. Each issue's output is written to its own log so multiple
+// issues can run concurrently without interleaving on the console.
 package runner
 
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/birdbox/nightshift/internal/gh"
 	"github.com/birdbox/nightshift/internal/git"
@@ -22,8 +25,18 @@ type Options struct {
 	Slug         string // owner/name
 	Base         string // base branch to branch from and target the PR at
 	Model        string // claude model alias/name; empty uses claude's default
-	WorktreeRoot string // parent directory under which worktrees are created
+	WorktreeRoot string // parent directory under which worktrees and logs live
 	Keep         bool   // keep worktrees after running instead of removing them
+	Stream       bool   // also tee output to stdout (used when running one at a time)
+}
+
+// Result reports the outcome of executing a single issue.
+type Result struct {
+	Issue   gh.Issue
+	Branch  string
+	LogPath string
+	Elapsed time.Duration
+	Err     error
 }
 
 var nonSlug = regexp.MustCompile(`[^a-z0-9]+`)
@@ -41,46 +54,73 @@ func branchSlug(title string) string {
 	return s
 }
 
-// Execute runs the full worktree + Claude flow for a single issue.
-func Execute(ctx context.Context, iss gh.Issue, opts Options) error {
+// Execute runs the full worktree + Claude flow for a single issue. It never
+// returns an error directly; the outcome (including any error) is reported in
+// the Result so callers can run many issues concurrently and aggregate.
+func Execute(ctx context.Context, iss gh.Issue, opts Options) Result {
+	start := time.Now()
 	branch := fmt.Sprintf("nightshift/issue-%d-%s", iss.Number, branchSlug(iss.Title))
 	worktreePath := filepath.Join(opts.WorktreeRoot, strings.ReplaceAll(branch, "/", "-"))
+	logPath := filepath.Join(opts.WorktreeRoot, fmt.Sprintf("issue-%d.log", iss.Number))
 
-	fmt.Printf("\n=== #%d %s\n", iss.Number, iss.Title)
-	fmt.Printf("    branch:   %s\n", branch)
-	fmt.Printf("    worktree: %s\n", worktreePath)
+	res := Result{Issue: iss, Branch: branch, LogPath: logPath}
+	finish := func(err error) Result {
+		res.Err = err
+		res.Elapsed = time.Since(start)
+		return res
+	}
+
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		return finish(fmt.Errorf("create log file: %w", err))
+	}
+	defer logFile.Close()
+
+	var out io.Writer = logFile
+	if opts.Stream {
+		out = io.MultiWriter(logFile, os.Stdout)
+	}
+
+	fmt.Fprintf(out, "=== #%d %s\n", iss.Number, iss.Title)
+	fmt.Fprintf(out, "    branch:   %s\n", branch)
+	fmt.Fprintf(out, "    worktree: %s\n\n", worktreePath)
 
 	if err := git.Fetch(ctx, opts.RepoDir, opts.Base); err != nil {
-		return fmt.Errorf("fetch origin/%s: %w", opts.Base, err)
+		return finish(logErr(out, fmt.Errorf("fetch origin/%s: %w", opts.Base, err)))
 	}
 	if err := git.AddWorktree(ctx, opts.RepoDir, worktreePath, branch, opts.Base); err != nil {
-		return fmt.Errorf("create worktree: %w", err)
+		return finish(logErr(out, fmt.Errorf("create worktree: %w", err)))
 	}
 
 	if !opts.Keep {
 		defer func() {
 			// Use a fresh context so cleanup still runs if ctx was canceled.
 			if err := git.RemoveWorktree(context.Background(), opts.RepoDir, worktreePath); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: could not remove worktree %s: %v\n", worktreePath, err)
+				fmt.Fprintf(out, "warning: could not remove worktree: %v\n", err)
 			}
 		}()
 	}
 
-	if err := runClaude(ctx, worktreePath, opts, iss, branch); err != nil {
-		return fmt.Errorf("claude execution: %w", err)
+	if err := runClaude(ctx, worktreePath, opts, iss, branch, out); err != nil {
+		return finish(logErr(out, fmt.Errorf("claude execution: %w", err)))
 	}
-	return nil
+	return finish(nil)
 }
 
-func runClaude(ctx context.Context, worktreePath string, opts Options, iss gh.Issue, branch string) error {
+func logErr(out io.Writer, err error) error {
+	fmt.Fprintf(out, "\nERROR: %v\n", err)
+	return err
+}
+
+func runClaude(ctx context.Context, worktreePath string, opts Options, iss gh.Issue, branch string, out io.Writer) error {
 	args := []string{"-p", buildPrompt(opts, iss, branch), "--dangerously-skip-permissions"}
 	if opts.Model != "" {
 		args = append(args, "--model", opts.Model)
 	}
 	cmd := exec.CommandContext(ctx, "claude", args...)
 	cmd.Dir = worktreePath
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = out
+	cmd.Stderr = out
 	return cmd.Run()
 }
 

@@ -28,14 +28,33 @@ nightshift --execute --yes # ...without the confirmation prompt
 
 - `--execute` — actually run Claude (otherwise dry run).
 - `--yes` — skip the confirmation prompt.
+- `--concurrency <n>` — how many issues to work on at once (default 3).
 - `--base <branch>` — base branch to branch from / target PRs at (default: repo default branch).
 - `--model <name>` — Claude model alias or full name (default: claude's own default).
 - `--keep` — keep worktrees after running, for inspection.
-- `--worktree-root <dir>` — where worktrees are created (default: a temp dir).
+- `--worktree-root <dir>` — where worktrees and logs are created (default: a temp dir).
 
 Each issue gets a branch `nightshift/issue-<n>-<slug>` off `origin/<base>`. Claude
 is told to read the repo's own `CLAUDE.md`/build config, run its own checks, and
-open a PR with `Closes #<n>`. Ctrl+C cancels and cleans up the worktree.
+open a PR with `Closes #<n>`. Ctrl+C cancels in-flight agents and cleans up their
+worktrees.
+
+### Concurrency and logs
+
+Issues run through a bounded worker pool. Because several agents' output would be
+unreadable interleaved, each agent writes its full output to a log file
+(`<worktree-root>/issue-<n>.log`) and the console shows one status line per event:
+
+```
+▶ #123 started — Fix flaky upload test
+▶ #128 started — Add rate limiting to /api/search
+✓ #123 done in 3m12s (log: /tmp/nightshift/nightshift/issue-123.log)
+✗ #128 failed in 1m4s: claude execution: exit status 1 (log: .../issue-128.log)
+
+Done. 1 succeeded, 1 failed.
+```
+
+With `--concurrency 1`, output is also teed live to the console.
 
 ## Requirements
 
@@ -51,6 +70,5 @@ go build -o nightshift .
 
 ## Roadmap
 
-- Run agents **concurrently** across worktrees (capped), instead of sequentially.
-- A Bubble Tea TUI for monitoring concurrent agents.
+- A Bubble Tea TUI for monitoring concurrent agents (tailing the per-issue logs).
 - Optional multi-project mode (a registry over per-repo config).

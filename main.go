@@ -16,6 +16,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/birdbox/nightshift/internal/gh"
 	"github.com/birdbox/nightshift/internal/runner"
@@ -42,6 +44,7 @@ func run() error {
 		base         = flag.String("base", "", "base branch to branch from and target PRs at (default: repo default branch)")
 		keep         = flag.Bool("keep", false, "keep worktrees after running instead of removing them")
 		worktreeRoot = flag.String("worktree-root", "", "parent directory for worktrees (default: a temp dir)")
+		concurrency  = flag.Int("concurrency", 3, "max issues to work on at once")
 		showVersion  = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Usage = usage
@@ -85,16 +88,36 @@ func run() error {
 		return nil
 	}
 
-	return execIssues(ctx, issues, slug, *base, *model, *worktreeRoot, *keep, *yes)
+	return execIssues(ctx, issues, execConfig{
+		slug:         slug,
+		base:         *base,
+		model:        *model,
+		worktreeRoot: *worktreeRoot,
+		keep:         *keep,
+		yes:          *yes,
+		concurrency:  *concurrency,
+	})
 }
 
-// execIssues resolves execution settings, confirms, and runs each issue.
-func execIssues(ctx context.Context, issues []gh.Issue, slug, base, model, worktreeRoot string, keep, yes bool) error {
+type execConfig struct {
+	slug         string
+	base         string
+	model        string
+	worktreeRoot string
+	keep         bool
+	yes          bool
+	concurrency  int
+}
+
+// execIssues resolves execution settings, confirms, and runs the issues through
+// a bounded worker pool.
+func execIssues(ctx context.Context, issues []gh.Issue, cfg execConfig) error {
 	repoDir, err := os.Getwd()
 	if err != nil {
 		return err
 	}
 
+	base := cfg.base
 	if base == "" {
 		base, err = gh.DefaultBranch(ctx)
 		if err != nil {
@@ -102,10 +125,11 @@ func execIssues(ctx context.Context, issues []gh.Issue, slug, base, model, workt
 		}
 	}
 
+	worktreeRoot := cfg.worktreeRoot
 	if worktreeRoot == "" {
-		name := slug
-		if i := strings.LastIndex(slug, "/"); i >= 0 {
-			name = slug[i+1:]
+		name := cfg.slug
+		if i := strings.LastIndex(cfg.slug, "/"); i >= 0 {
+			name = cfg.slug[i+1:]
 		}
 		worktreeRoot = filepath.Join(os.TempDir(), "nightshift", name)
 	}
@@ -113,33 +137,82 @@ func execIssues(ctx context.Context, issues []gh.Issue, slug, base, model, workt
 		return fmt.Errorf("create worktree root: %w", err)
 	}
 
-	fmt.Printf("\nAbout to launch Claude on %d issue(s) in %s, branching from %q.\n", len(issues), slug, base)
-	if !yes && !confirm("Proceed?") {
+	concurrency := cfg.concurrency
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	if concurrency > len(issues) {
+		concurrency = len(issues)
+	}
+
+	fmt.Printf("\nAbout to launch Claude on %d issue(s) in %s, branching from %q, %d at a time.\n",
+		len(issues), cfg.slug, base, concurrency)
+	if !cfg.yes && !confirm("Proceed?") {
 		fmt.Println("Aborted.")
 		return nil
 	}
 
 	opts := runner.Options{
 		RepoDir:      repoDir,
-		Slug:         slug,
+		Slug:         cfg.slug,
 		Base:         base,
-		Model:        model,
+		Model:        cfg.model,
 		WorktreeRoot: worktreeRoot,
-		Keep:         keep,
+		Keep:         cfg.keep,
+		// With one worker, tee live output to the console; otherwise logs only.
+		Stream: concurrency == 1,
 	}
 
-	var failures int
+	return runPool(ctx, issues, opts, concurrency)
+}
+
+// runPool runs issues through a bounded pool of workers, printing one status
+// line per lifecycle event and a final summary.
+func runPool(ctx context.Context, issues []gh.Issue, opts runner.Options, concurrency int) error {
+	var (
+		mu        sync.Mutex // serializes console writes and the failure counter
+		failures  int
+		wg        sync.WaitGroup
+		semaphore = make(chan struct{}, concurrency)
+	)
+
+	report := func(format string, args ...any) {
+		mu.Lock()
+		fmt.Printf(format+"\n", args...)
+		mu.Unlock()
+	}
+
 	for _, iss := range issues {
-		if err := runner.Execute(ctx, iss, opts); err != nil {
-			failures++
-			fmt.Fprintf(os.Stderr, "issue #%d failed: %v\n", iss.Number, err)
-		}
 		if ctx.Err() != nil {
-			fmt.Fprintln(os.Stderr, "\ninterrupted; stopping.")
 			break
 		}
+		wg.Add(1)
+		semaphore <- struct{}{}
+		go func(iss gh.Issue) {
+			defer wg.Done()
+			defer func() { <-semaphore }()
+
+			report("▶ #%d started — %s", iss.Number, iss.Title)
+			res := runner.Execute(ctx, iss, opts)
+
+			mu.Lock()
+			if res.Err != nil {
+				failures++
+				fmt.Printf("✗ #%d failed in %s: %v (log: %s)\n",
+					iss.Number, res.Elapsed.Round(time.Second), res.Err, res.LogPath)
+			} else {
+				fmt.Printf("✓ #%d done in %s (log: %s)\n",
+					iss.Number, res.Elapsed.Round(time.Second), res.LogPath)
+			}
+			mu.Unlock()
+		}(iss)
 	}
 
+	wg.Wait()
+
+	if ctx.Err() != nil {
+		fmt.Fprintln(os.Stderr, "\ninterrupted.")
+	}
 	fmt.Printf("\nDone. %d succeeded, %d failed.\n", len(issues)-failures, failures)
 	if failures > 0 {
 		return fmt.Errorf("%d issue(s) failed", failures)
