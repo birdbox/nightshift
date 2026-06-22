@@ -19,7 +19,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/birdbox/nightshift/internal/gh"
+	"github.com/birdbox/nightshift/internal/github"
 	"github.com/birdbox/nightshift/internal/runner"
 )
 
@@ -59,21 +59,22 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	if err := gh.AuthStatus(ctx); err != nil {
-		return fmt.Errorf("GitHub CLI not ready (try `gh auth login`): %w", err)
-	}
-
-	slug, err := gh.RepoSlug(ctx)
-	if err != nil {
-		return fmt.Errorf("could not determine a GitHub repo from the current directory: %w", err)
-	}
-
-	issues, selection, err := selectIssues(ctx, flag.Args(), *assignee, *label, *state, *limit)
+	repoDir, err := os.Getwd()
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("Repository: %s\n", slug)
+	client, err := github.NewClient(ctx, repoDir)
+	if err != nil {
+		return err
+	}
+
+	issues, selection, err := selectIssues(ctx, client, flag.Args(), *assignee, *label, *state, *limit)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Repository: %s\n", client.Slug())
 	fmt.Printf("Selection:  %s\n", selection)
 	fmt.Printf("Found %d issue(s).\n", len(issues))
 	printIssues(issues)
@@ -88,8 +89,7 @@ func run() error {
 		return nil
 	}
 
-	return execIssues(ctx, issues, execConfig{
-		slug:         slug,
+	return execIssues(ctx, client, repoDir, issues, execConfig{
 		base:         *base,
 		model:        *model,
 		worktreeRoot: *worktreeRoot,
@@ -100,7 +100,6 @@ func run() error {
 }
 
 type execConfig struct {
-	slug         string
 	base         string
 	model        string
 	worktreeRoot string
@@ -111,15 +110,13 @@ type execConfig struct {
 
 // execIssues resolves execution settings, confirms, and runs the issues through
 // a bounded worker pool.
-func execIssues(ctx context.Context, issues []gh.Issue, cfg execConfig) error {
-	repoDir, err := os.Getwd()
-	if err != nil {
-		return err
-	}
+func execIssues(ctx context.Context, client *github.Client, repoDir string, issues []github.Issue, cfg execConfig) error {
+	slug := client.Slug()
 
 	base := cfg.base
 	if base == "" {
-		base, err = gh.DefaultBranch(ctx)
+		var err error
+		base, err = client.DefaultBranch(ctx)
 		if err != nil {
 			return fmt.Errorf("could not determine the default branch (set --base): %w", err)
 		}
@@ -127,9 +124,9 @@ func execIssues(ctx context.Context, issues []gh.Issue, cfg execConfig) error {
 
 	worktreeRoot := cfg.worktreeRoot
 	if worktreeRoot == "" {
-		name := cfg.slug
-		if i := strings.LastIndex(cfg.slug, "/"); i >= 0 {
-			name = cfg.slug[i+1:]
+		name := slug
+		if i := strings.LastIndex(slug, "/"); i >= 0 {
+			name = slug[i+1:]
 		}
 		worktreeRoot = filepath.Join(os.TempDir(), "nightshift", name)
 	}
@@ -146,15 +143,16 @@ func execIssues(ctx context.Context, issues []gh.Issue, cfg execConfig) error {
 	}
 
 	fmt.Printf("\nAbout to launch Claude on %d issue(s) in %s, branching from %q, %d at a time.\n",
-		len(issues), cfg.slug, base, concurrency)
+		len(issues), slug, base, concurrency)
 	if !cfg.yes && !confirm("Proceed?") {
 		fmt.Println("Aborted.")
 		return nil
 	}
 
 	opts := runner.Options{
+		Client:       client,
 		RepoDir:      repoDir,
-		Slug:         cfg.slug,
+		Slug:         slug,
 		Base:         base,
 		Model:        cfg.model,
 		WorktreeRoot: worktreeRoot,
@@ -168,7 +166,7 @@ func execIssues(ctx context.Context, issues []gh.Issue, cfg execConfig) error {
 
 // runPool runs issues through a bounded pool of workers, printing one status
 // line per lifecycle event and a final summary.
-func runPool(ctx context.Context, issues []gh.Issue, opts runner.Options, concurrency int) error {
+func runPool(ctx context.Context, issues []github.Issue, opts runner.Options, concurrency int) error {
 	var (
 		mu        sync.Mutex // serializes console writes and the failure counter
 		failures  int
@@ -188,7 +186,7 @@ func runPool(ctx context.Context, issues []gh.Issue, opts runner.Options, concur
 		}
 		wg.Add(1)
 		semaphore <- struct{}{}
-		go func(iss gh.Issue) {
+		go func(iss github.Issue) {
 			defer wg.Done()
 			defer func() { <-semaphore }()
 
@@ -196,13 +194,17 @@ func runPool(ctx context.Context, issues []gh.Issue, opts runner.Options, concur
 			res := runner.Execute(ctx, iss, opts)
 
 			mu.Lock()
-			if res.Err != nil {
+			switch {
+			case res.Err != nil:
 				failures++
 				fmt.Printf("✗ #%d failed in %s: %v (log: %s)\n",
 					iss.Number, res.Elapsed.Round(time.Second), res.Err, res.LogPath)
-			} else {
-				fmt.Printf("✓ #%d done in %s (log: %s)\n",
-					iss.Number, res.Elapsed.Round(time.Second), res.LogPath)
+			case res.PRURL != "":
+				fmt.Printf("✓ #%d done in %s → %s\n",
+					iss.Number, res.Elapsed.Round(time.Second), res.PRURL)
+			default:
+				fmt.Printf("✓ #%d done in %s (%s; log: %s)\n",
+					iss.Number, res.Elapsed.Round(time.Second), res.Note, res.LogPath)
 			}
 			mu.Unlock()
 		}(iss)
@@ -222,24 +224,27 @@ func runPool(ctx context.Context, issues []gh.Issue, opts runner.Options, concur
 
 // selectIssues resolves the issues to act on. Explicit issue numbers as
 // positional args bypass the filters; otherwise the filters apply.
-func selectIssues(ctx context.Context, args []string, assignee, label, state string, limit int) ([]gh.Issue, string, error) {
+func selectIssues(ctx context.Context, client *github.Client, args []string, assignee, label, state string, limit int) ([]github.Issue, string, error) {
 	if len(args) > 0 {
-		var issues []gh.Issue
+		var issues []github.Issue
 		for _, a := range args {
 			n, err := strconv.Atoi(strings.TrimPrefix(a, "#"))
 			if err != nil {
 				return nil, "", fmt.Errorf("invalid issue number %q", a)
 			}
-			iss, err := gh.GetIssue(ctx, n)
+			iss, err := client.GetIssue(ctx, n)
 			if err != nil {
 				return nil, "", err
+			}
+			if iss.IsPullRequest() {
+				return nil, "", fmt.Errorf("#%d is a pull request, not an issue", n)
 			}
 			issues = append(issues, iss)
 		}
 		return issues, "explicit issue numbers: " + strings.Join(args, ", "), nil
 	}
 
-	issues, err := gh.ListIssues(ctx, gh.ListOptions{
+	issues, err := client.ListIssues(ctx, github.ListOptions{
 		Assignee: assignee,
 		Label:    label,
 		State:    state,
@@ -259,7 +264,7 @@ func selectIssues(ctx context.Context, args []string, assignee, label, state str
 	return issues, strings.Join(parts, ", "), nil
 }
 
-func printIssues(issues []gh.Issue) {
+func printIssues(issues []github.Issue) {
 	for _, iss := range issues {
 		fmt.Printf("\n  #%-5d %s\n", iss.Number, iss.Title)
 		if names := iss.LabelNames(); names != "" {

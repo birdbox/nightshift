@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -37,5 +38,33 @@ func AddWorktree(ctx context.Context, repoDir, path, branch, base string) error 
 // RemoveWorktree force-removes the worktree at path (the branch is preserved).
 func RemoveWorktree(ctx context.Context, repoDir, path string) error {
 	_, err := run(ctx, repoDir, "worktree", "remove", path, "--force")
+	return err
+}
+
+// RemoteURL returns the URL configured for the named remote (e.g. "origin").
+func RemoteURL(ctx context.Context, repoDir, remote string) (string, error) {
+	out, err := run(ctx, repoDir, "remote", "get-url", remote)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// CommitCount returns how many commits HEAD has that ref does not.
+func CommitCount(ctx context.Context, dir, ref string) (int, error) {
+	out, err := run(ctx, dir, "rev-list", "--count", ref+"..HEAD")
+	if err != nil {
+		return 0, err
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0, fmt.Errorf("parse commit count: %w", err)
+	}
+	return n, nil
+}
+
+// Push pushes branch to origin from the given directory, setting upstream.
+func Push(ctx context.Context, dir, branch string) error {
+	_, err := run(ctx, dir, "push", "-u", "origin", branch)
 	return err
 }

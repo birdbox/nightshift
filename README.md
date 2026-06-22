@@ -36,8 +36,9 @@ nightshift --execute --yes # ...without the confirmation prompt
 
 Each issue gets a branch `nightshift/issue-<n>-<slug>` off `origin/<base>`. Claude
 is told to read the repo's own `CLAUDE.md`/build config, run its own checks, and
-open a PR with `Closes #<n>`. Ctrl+C cancels in-flight agents and cleans up their
-worktrees.
+commit — then **nightshift** pushes the branch and opens the PR (with `Closes
+#<n>`) via the GitHub API. If the agent produces no commits, no PR is opened.
+Ctrl+C cancels in-flight agents and cleans up their worktrees.
 
 ### Concurrency and logs
 
@@ -58,9 +59,18 @@ With `--concurrency 1`, output is also teed live to the console.
 
 ## Requirements
 
-- [`gh`](https://cli.github.com/) installed and authenticated (`gh auth login`).
-  nightshift borrows gh's auth instead of managing its own token.
-- `git`
+- `git` (with push access to the repo's `origin`, e.g. an SSH key).
+- `claude` (Claude Code CLI), authenticated.
+- A GitHub token in `GITHUB_TOKEN` (or `GH_TOKEN`) with access to the repo's
+  issues and pull requests. nightshift talks to the GitHub REST API directly —
+  no `gh` CLI required.
+
+  ```
+  export GITHUB_TOKEN=ghp_...        # a personal access token
+  ```
+
+  A fine-grained token needs Contents (read/write), Pull requests (read/write),
+  and Issues (read) on the target repo; a classic token needs `repo`.
 
 ## Build
 

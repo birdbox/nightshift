@@ -1,7 +1,8 @@
 // Package runner orchestrates execution of a single issue: it creates an
-// isolated git worktree, runs Claude Code inside it, and tears the worktree
-// down afterward. Each issue's output is written to its own log so multiple
-// issues can run concurrently without interleaving on the console.
+// isolated git worktree, runs Claude Code in it, then pushes the branch and
+// opens a pull request via the GitHub API. Each issue's output is written to
+// its own log so multiple issues can run concurrently without interleaving on
+// the console.
 package runner
 
 import (
@@ -15,26 +16,29 @@ import (
 	"strings"
 	"time"
 
-	"github.com/birdbox/nightshift/internal/gh"
 	"github.com/birdbox/nightshift/internal/git"
+	"github.com/birdbox/nightshift/internal/github"
 )
 
 // Options configures issue execution.
 type Options struct {
-	RepoDir      string // the repository working directory (nightshift's CWD)
-	Slug         string // owner/name
-	Base         string // base branch to branch from and target the PR at
-	Model        string // claude model alias/name; empty uses claude's default
-	WorktreeRoot string // parent directory under which worktrees and logs live
-	Keep         bool   // keep worktrees after running instead of removing them
-	Stream       bool   // also tee output to stdout (used when running one at a time)
+	Client       *github.Client // GitHub API client (PR creation)
+	RepoDir      string         // the repository working directory (nightshift's CWD)
+	Slug         string         // owner/name
+	Base         string         // base branch to branch from and target the PR at
+	Model        string         // claude model alias/name; empty uses claude's default
+	WorktreeRoot string         // parent directory under which worktrees and logs live
+	Keep         bool           // keep worktrees after running instead of removing them
+	Stream       bool           // also tee output to stdout (used when running one at a time)
 }
 
 // Result reports the outcome of executing a single issue.
 type Result struct {
-	Issue   gh.Issue
+	Issue   github.Issue
 	Branch  string
 	LogPath string
+	PRURL   string // set when a pull request was opened
+	Note    string // human-readable note when no PR was opened but no error occurred
 	Elapsed time.Duration
 	Err     error
 }
@@ -54,10 +58,10 @@ func branchSlug(title string) string {
 	return s
 }
 
-// Execute runs the full worktree + Claude flow for a single issue. It never
+// Execute runs the full worktree + Claude + PR flow for a single issue. It never
 // returns an error directly; the outcome (including any error) is reported in
 // the Result so callers can run many issues concurrently and aggregate.
-func Execute(ctx context.Context, iss gh.Issue, opts Options) Result {
+func Execute(ctx context.Context, iss github.Issue, opts Options) Result {
 	start := time.Now()
 	branch := fmt.Sprintf("nightshift/issue-%d-%s", iss.Number, branchSlug(iss.Title))
 	worktreePath := filepath.Join(opts.WorktreeRoot, strings.ReplaceAll(branch, "/", "-"))
@@ -104,6 +108,30 @@ func Execute(ctx context.Context, iss gh.Issue, opts Options) Result {
 	if err := runClaude(ctx, worktreePath, opts, iss, branch, out); err != nil {
 		return finish(logErr(out, fmt.Errorf("claude execution: %w", err)))
 	}
+
+	// The agent commits its work; nightshift pushes and opens the PR.
+	n, err := git.CommitCount(ctx, worktreePath, "origin/"+opts.Base)
+	if err != nil {
+		return finish(logErr(out, fmt.Errorf("count commits: %w", err)))
+	}
+	if n == 0 {
+		res.Note = "agent produced no commits; no PR opened"
+		fmt.Fprintf(out, "\n%s\n", res.Note)
+		return finish(nil)
+	}
+
+	fmt.Fprintf(out, "\nPushing %s and opening a pull request...\n", branch)
+	if err := git.Push(ctx, worktreePath, branch); err != nil {
+		return finish(logErr(out, fmt.Errorf("push branch: %w", err)))
+	}
+
+	body := fmt.Sprintf("Closes #%d\n\nOpened automatically by nightshift.", iss.Number)
+	prURL, err := opts.Client.CreatePR(ctx, iss.Title, branch, opts.Base, body)
+	if err != nil {
+		return finish(logErr(out, fmt.Errorf("create pull request: %w", err)))
+	}
+	res.PRURL = prURL
+	fmt.Fprintf(out, "Pull request: %s\n", prURL)
 	return finish(nil)
 }
 
@@ -112,7 +140,7 @@ func logErr(out io.Writer, err error) error {
 	return err
 }
 
-func runClaude(ctx context.Context, worktreePath string, opts Options, iss gh.Issue, branch string, out io.Writer) error {
+func runClaude(ctx context.Context, worktreePath string, opts Options, iss github.Issue, branch string, out io.Writer) error {
 	args := []string{"-p", buildPrompt(opts, iss, branch), "--dangerously-skip-permissions"}
 	if opts.Model != "" {
 		args = append(args, "--model", opts.Model)
@@ -124,7 +152,7 @@ func runClaude(ctx context.Context, worktreePath string, opts Options, iss gh.Is
 	return cmd.Run()
 }
 
-func buildPrompt(opts Options, iss gh.Issue, branch string) string {
+func buildPrompt(opts Options, iss github.Issue, branch string) string {
 	body := strings.TrimSpace(iss.Body)
 	if body == "" {
 		body = "(no description provided)"
@@ -144,10 +172,9 @@ Do the following:
 1. Read the repository's own conventions first — CLAUDE.md, AGENTS.md, CONTRIBUTING, and the build config (package.json scripts, Makefile, go.mod, etc.). Follow them. Do not assume a stack.
 2. Explore the relevant code, then implement a focused, minimal change that fully resolves the issue. Do not touch unrelated files.
 3. Run the repository's own verification (format, lint, type-check, tests) as defined by its tooling, and fix problems until everything passes.
-4. Commit using the repository's commit convention (default to Conventional Commits if unclear).
-5. Push the branch to origin and open a pull request targeting %q. Include "Closes #%d" in the PR body so the issue links and closes on merge.
-6. As your final output, print the URL of the pull request you opened.
+4. Commit your work using the repository's commit convention (default to Conventional Commits if unclear). Do NOT push and do NOT open a pull request — nightshift pushes the branch and opens the PR for you.
+5. As your final output, briefly summarize what you changed.
 
-If you cannot complete the task, stop and explain what blocked you instead of opening a partial PR.`,
-		opts.Slug, iss.Number, iss.Title, iss.URL, branch, opts.Base, body, opts.Base, iss.Number)
+If you cannot complete the task, stop and explain what blocked you instead of committing a broken change.`,
+		opts.Slug, iss.Number, iss.Title, iss.URL, branch, opts.Base, body)
 }
