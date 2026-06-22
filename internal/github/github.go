@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Matthias Eder
+
 // Package github talks to the GitHub REST API directly over net/http so
 // nightshift needs no external CLI at runtime. Authentication uses a token from
 // the GITHUB_TOKEN (or GH_TOKEN) environment variable. The repository is

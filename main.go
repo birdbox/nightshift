@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Matthias Eder
+
 // Command nightshift is an autonomous ticket-execution harness. Run inside a
 // git repository, it finds GitHub issues to work on and drives Claude Code in
 // isolated git worktrees to implement them and open pull requests.

@@ -82,3 +82,12 @@ go build -o nightshift .
 
 - A Bubble Tea TUI for monitoring concurrent agents (tailing the per-issue logs).
 - Optional multi-project mode (a registry over per-repo config).
+
+## License
+
+nightshift is free software, licensed under the **GNU General Public License
+v3.0 or later** (GPL-3.0-or-later). See [LICENSE](LICENSE) for the full text.
+
+This means you're free to use, study, share, and modify it — but if you
+distribute a modified version, you must release your changes under the same
+license. Forks stay open.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Matthias Eder
+
 // Package runner orchestrates execution of a single issue: it creates an
 // isolated git worktree, runs Claude Code in it, then pushes the branch and
 // opens a pull request via the GitHub API. Each issue's output is written to

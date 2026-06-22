@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Matthias Eder
+
 // Package git wraps the git operations nightshift needs to run agents in
 // isolated worktrees.
 package git
