@@ -23,12 +23,18 @@ import (
 	"github.com/birdbox/nightshift/internal/git"
 )
 
-const apiBase = "https://api.github.com"
+// apiBase is the GitHub REST API root. It is a var (not a const) only so tests
+// can point the client at an httptest server.
+var apiBase = "https://api.github.com"
 
 // ErrBadCredentials wraps any API response that rejected the token (HTTP 401),
 // i.e. the token is missing, invalid, expired, or revoked. Callers can detect
 // it with errors.Is to re-prompt for a fresh token.
 var ErrBadCredentials = errors.New("GitHub rejected the token (invalid, expired, or revoked)")
+
+// ErrNotFound wraps any API response that reported the resource as missing
+// (HTTP 404). Callers can detect it with errors.Is to make removals idempotent.
+var ErrNotFound = errors.New("GitHub returned 404 (resource not found)")
 
 // Client is an authenticated GitHub REST client scoped to one repository.
 type Client struct {
@@ -155,6 +161,9 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 		apiErr := fmt.Errorf("GitHub API %s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(data)))
 		if resp.StatusCode == http.StatusUnauthorized {
 			return fmt.Errorf("%w: %w", ErrBadCredentials, apiErr)
+		}
+		if resp.StatusCode == http.StatusNotFound {
+			return fmt.Errorf("%w: %w", ErrNotFound, apiErr)
 		}
 		return apiErr
 	}
@@ -323,4 +332,66 @@ func (c *Client) ListOpenPRs(ctx context.Context) ([]PullRequest, error) {
 		return nil, err
 	}
 	return prs, nil
+}
+
+// CommentOnIssue posts a comment on an issue.
+func (c *Client) CommentOnIssue(ctx context.Context, number int, body string) error {
+	reqBody := map[string]any{"body": body}
+	path := fmt.Sprintf("/repos/%s/%s/issues/%d/comments", c.owner, c.repo, number)
+	return c.do(ctx, http.MethodPost, path, reqBody, nil)
+}
+
+// AddLabels adds labels to an issue, leaving any existing labels in place. It is
+// a no-op when no labels are given. Adding a label already present is harmless.
+func (c *Client) AddLabels(ctx context.Context, number int, labels ...string) error {
+	if len(labels) == 0 {
+		return nil
+	}
+	reqBody := map[string]any{"labels": labels}
+	path := fmt.Sprintf("/repos/%s/%s/issues/%d/labels", c.owner, c.repo, number)
+	return c.do(ctx, http.MethodPost, path, reqBody, nil)
+}
+
+// RemoveLabel removes a single label from an issue. Removing a label the issue
+// does not have returns 404; that is treated as success so removal is
+// idempotent.
+func (c *Client) RemoveLabel(ctx context.Context, number int, label string) error {
+	path := fmt.Sprintf("/repos/%s/%s/issues/%d/labels/%s", c.owner, c.repo, number, url.PathEscape(label))
+	if err := c.do(ctx, http.MethodDelete, path, nil, nil); err != nil && !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	return nil
+}
+
+// IssueUpdate names the fields UpdateIssue can change. Zero-valued fields are
+// omitted from the request, so only the fields you set are touched; a non-nil
+// (possibly empty) Labels slice replaces the issue's entire label set.
+type IssueUpdate struct {
+	State  string   // "open" or "closed"; "" leaves it unchanged
+	Title  string   // "" leaves it unchanged
+	Body   string   // "" leaves it unchanged
+	Labels []string // nil leaves labels unchanged; non-nil replaces them
+}
+
+// UpdateIssue patches an issue's state and/or fields. It is a no-op when update
+// names no fields.
+func (c *Client) UpdateIssue(ctx context.Context, number int, update IssueUpdate) error {
+	reqBody := map[string]any{}
+	if update.State != "" {
+		reqBody["state"] = update.State
+	}
+	if update.Title != "" {
+		reqBody["title"] = update.Title
+	}
+	if update.Body != "" {
+		reqBody["body"] = update.Body
+	}
+	if update.Labels != nil {
+		reqBody["labels"] = update.Labels
+	}
+	if len(reqBody) == 0 {
+		return nil
+	}
+	path := fmt.Sprintf("/repos/%s/%s/issues/%d", c.owner, c.repo, number)
+	return c.do(ctx, http.MethodPatch, path, reqBody, nil)
 }

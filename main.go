@@ -53,22 +53,24 @@ func run() error {
 
 func runExec() error {
 	var (
-		assignee     = flag.String("assignee", "@me", "filter issues by assignee (gh syntax: @me, a login, or empty for any)")
-		label        = flag.String("label", "", "filter issues by label")
-		state        = flag.String("state", "open", "issue state: open, closed, all")
-		limit        = flag.Int("limit", 20, "max issues to consider")
-		execute      = flag.Bool("execute", false, "actually run Claude on the selected issues (default is a dry run)")
-		yes          = flag.Bool("yes", false, "skip the confirmation prompt before executing")
-		model        = flag.String("model", "", "Claude model to use (alias or full name); empty uses claude's default")
-		base         = flag.String("base", "", "base branch to branch from and target PRs at (default: repo default branch)")
-		keep         = flag.Bool("keep", false, "keep worktrees after running instead of removing them")
-		worktreeRoot = flag.String("worktree-root", "", "parent directory for worktrees (default: a temp dir)")
-		concurrency  = flag.Int("concurrency", 3, "max issues to work on at once")
-		force        = flag.Bool("force", false, "act on issues even if they already have an open PR")
-		token        = flag.String("token", "", "GitHub token to use for this run (overrides env and saved token)")
-		logout       = flag.Bool("logout", false, "delete the saved GitHub token and exit")
-		clean        = flag.Bool("clean", false, "remove this repo's nightshift worktree root (logs and leftover worktrees) and exit")
-		showVersion  = flag.Bool("version", false, "print version and exit")
+		assignee        = flag.String("assignee", "@me", "filter issues by assignee (gh syntax: @me, a login, or empty for any)")
+		label           = flag.String("label", "", "filter issues by label")
+		state           = flag.String("state", "open", "issue state: open, closed, all")
+		limit           = flag.Int("limit", 20, "max issues to consider")
+		execute         = flag.Bool("execute", false, "actually run Claude on the selected issues (default is a dry run)")
+		yes             = flag.Bool("yes", false, "skip the confirmation prompt before executing")
+		model           = flag.String("model", "", "Claude model to use (alias or full name); empty uses claude's default")
+		base            = flag.String("base", "", "base branch to branch from and target PRs at (default: repo default branch)")
+		keep            = flag.Bool("keep", false, "keep worktrees after running instead of removing them")
+		worktreeRoot    = flag.String("worktree-root", "", "parent directory for worktrees (default: a temp dir)")
+		concurrency     = flag.Int("concurrency", 3, "max issues to work on at once")
+		force           = flag.Bool("force", false, "act on issues even if they already have an open PR")
+		updateIssues    = flag.Bool("update-issues", false, "comment the outcome on each issue (PR URL or failure reason) and mark it in-progress while working; off by default so runs don't mutate issues")
+		inProgressLabel = flag.String("in-progress-label", "nightshift:in-progress", "label applied while an agent works an issue and removed afterward (with --update-issues); empty disables labeling")
+		token           = flag.String("token", "", "GitHub token to use for this run (overrides env and saved token)")
+		logout          = flag.Bool("logout", false, "delete the saved GitHub token and exit")
+		clean           = flag.Bool("clean", false, "remove this repo's nightshift worktree root (logs and leftover worktrees) and exit")
+		showVersion     = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Usage = usage
 	flag.Parse()
@@ -169,12 +171,14 @@ func runExec() error {
 	}
 
 	return execIssues(ctx, client, repoDir, actionable, execConfig{
-		base:         *base,
-		model:        *model,
-		worktreeRoot: *worktreeRoot,
-		keep:         *keep,
-		yes:          *yes,
-		concurrency:  *concurrency,
+		base:            *base,
+		model:           *model,
+		worktreeRoot:    *worktreeRoot,
+		keep:            *keep,
+		yes:             *yes,
+		concurrency:     *concurrency,
+		updateIssues:    *updateIssues,
+		inProgressLabel: *inProgressLabel,
 	})
 }
 
@@ -231,12 +235,14 @@ func cleanWorktreeRoot(ctx context.Context, repoDir, worktreeRoot string) error 
 }
 
 type execConfig struct {
-	base         string
-	model        string
-	worktreeRoot string
-	keep         bool
-	yes          bool
-	concurrency  int
+	base            string
+	model           string
+	worktreeRoot    string
+	keep            bool
+	yes             bool
+	concurrency     int
+	updateIssues    bool
+	inProgressLabel string
 }
 
 // execIssues resolves execution settings, confirms, and runs the issues through
@@ -275,19 +281,28 @@ func execIssues(ctx context.Context, client *github.Client, repoDir string, issu
 
 	fmt.Printf("\nAbout to launch Claude on %d issue(s) in %s, branching from %q, %d at a time.\n",
 		len(issues), slug, base, concurrency)
+	if cfg.updateIssues {
+		if cfg.inProgressLabel != "" {
+			fmt.Printf("Issue write-back is ON: will comment outcomes and toggle the %q label.\n", cfg.inProgressLabel)
+		} else {
+			fmt.Println("Issue write-back is ON: will comment outcomes (no in-progress label).")
+		}
+	}
 	if !cfg.yes && !confirm("Proceed?") {
 		fmt.Println("Aborted.")
 		return nil
 	}
 
 	opts := runner.Options{
-		Client:       client,
-		RepoDir:      repoDir,
-		Slug:         slug,
-		Base:         base,
-		Model:        cfg.model,
-		WorktreeRoot: worktreeRoot,
-		Keep:         cfg.keep,
+		Client:          client,
+		RepoDir:         repoDir,
+		Slug:            slug,
+		Base:            base,
+		Model:           cfg.model,
+		WorktreeRoot:    worktreeRoot,
+		Keep:            cfg.keep,
+		WriteBack:       cfg.updateIssues,
+		InProgressLabel: cfg.inProgressLabel,
 		// With one worker, tee live output to the console; otherwise logs only.
 		Stream: concurrency == 1,
 	}
