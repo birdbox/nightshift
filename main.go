@@ -94,6 +94,10 @@ func runExec() error {
 		return nil
 	}
 
+	if err := validateState(*state); err != nil {
+		return err
+	}
+
 	// Cancel running agents (and trigger worktree cleanup) on Ctrl+C.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -423,6 +427,18 @@ func mapPRsToIssues(prs []github.PullRequest) map[int]github.PullRequest {
 	return m
 }
 
+// validateState rejects --state values the GitHub API would not understand,
+// turning a confusing remote error into a clear local one before any network
+// call. The accepted values mirror the GitHub issues API.
+func validateState(state string) error {
+	switch state {
+	case "open", "closed", "all":
+		return nil
+	default:
+		return fmt.Errorf("invalid --state %q: must be one of open, closed, all", state)
+	}
+}
+
 // selectIssues resolves the issues to act on. Explicit issue numbers as
 // positional args bypass the filters; otherwise the filters apply.
 func selectIssues(ctx context.Context, client *github.Client, args []string, assignee, label, state string, limit int) ([]github.Issue, string, error) {
@@ -479,6 +495,10 @@ func cmdList(argv []string) error {
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(argv); err != nil {
+		return err
+	}
+
+	if err := validateState(*state); err != nil {
 		return err
 	}
 
