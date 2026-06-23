@@ -44,6 +44,13 @@ func RemoveWorktree(ctx context.Context, repoDir, path string) error {
 	return err
 }
 
+// PruneWorktrees clears git's administrative entries for worktrees whose
+// working directories no longer exist (e.g. after their root was deleted).
+func PruneWorktrees(ctx context.Context, repoDir string) error {
+	_, err := run(ctx, repoDir, "worktree", "prune")
+	return err
+}
+
 // RemoteURL returns the URL configured for the named remote (e.g. "origin").
 func RemoteURL(ctx context.Context, repoDir, remote string) (string, error) {
 	out, err := run(ctx, repoDir, "remote", "get-url", remote)
