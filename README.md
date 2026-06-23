@@ -209,8 +209,9 @@ from the tag automatically.
 
 ## Roadmap
 
-- A Bubble Tea TUI for monitoring concurrent agents (tailing the per-issue logs).
-- Optional multi-project mode (a registry over per-repo config).
+Planned work is tracked by milestone in [ROADMAP.md](ROADMAP.md) — release
+distribution, issue write-back, a monitoring TUI, multi-project mode, and the
+road to 1.0.
 
 ## License
 
