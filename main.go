@@ -57,6 +57,15 @@ func run() error {
 	flag.Usage = usage
 	flag.Parse()
 
+	// Let flags and issue numbers appear in any order. The stdlib flag package
+	// stops at the first positional arg, so collect positionals and keep parsing
+	// the remainder after each one.
+	var positional []string
+	for rest := flag.Args(); len(rest) > 0; rest = flag.Args() {
+		positional = append(positional, rest[0])
+		flag.CommandLine.Parse(rest[1:])
+	}
+
 	if *showVersion {
 		fmt.Println("nightshift " + version)
 		return nil
@@ -85,7 +94,7 @@ func run() error {
 		return err
 	}
 
-	issues, selection, err := selectIssues(ctx, client, flag.Args(), *assignee, *label, *state, *limit)
+	issues, selection, err := selectIssues(ctx, client, positional, *assignee, *label, *state, *limit)
 	if err != nil {
 		return err
 	}
