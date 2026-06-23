@@ -11,11 +11,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -24,6 +24,11 @@ import (
 )
 
 const apiBase = "https://api.github.com"
+
+// ErrBadCredentials wraps any API response that rejected the token (HTTP 401),
+// i.e. the token is missing, invalid, expired, or revoked. Callers can detect
+// it with errors.Is to re-prompt for a fresh token.
+var ErrBadCredentials = errors.New("GitHub rejected the token (invalid, expired, or revoked)")
 
 // Client is an authenticated GitHub REST client scoped to one repository.
 type Client struct {
@@ -35,14 +40,11 @@ type Client struct {
 }
 
 // NewClient builds a client for the repo whose origin remote lives in repoDir,
-// authenticating with GITHUB_TOKEN/GH_TOKEN and verifying the token works.
-func NewClient(ctx context.Context, repoDir string) (*Client, error) {
-	token := os.Getenv("GITHUB_TOKEN")
-	if token == "" {
-		token = os.Getenv("GH_TOKEN")
-	}
-	if token == "" {
-		return nil, fmt.Errorf("no GitHub token found; set GITHUB_TOKEN to a personal access token with repo and issues access")
+// using the given token, and verifies the token works by calling the API. If
+// the token is rejected, the returned error wraps ErrBadCredentials.
+func NewClient(ctx context.Context, repoDir, token string) (*Client, error) {
+	if strings.TrimSpace(token) == "" {
+		return nil, fmt.Errorf("empty GitHub token")
 	}
 
 	remote, err := git.RemoteURL(ctx, repoDir, "origin")
@@ -139,7 +141,11 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 
 	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("GitHub API %s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(data)))
+		apiErr := fmt.Errorf("GitHub API %s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(data)))
+		if resp.StatusCode == http.StatusUnauthorized {
+			return fmt.Errorf("%w: %w", ErrBadCredentials, apiErr)
+		}
+		return apiErr
 	}
 	if out != nil {
 		if err := json.Unmarshal(data, out); err != nil {

@@ -61,16 +61,30 @@ With `--concurrency 1`, output is also teed live to the console.
 
 - `git` (with push access to the repo's `origin`, e.g. an SSH key).
 - `claude` (Claude Code CLI), authenticated.
-- A GitHub token in `GITHUB_TOKEN` (or `GH_TOKEN`) with access to the repo's
-  issues and pull requests. nightshift talks to the GitHub REST API directly —
-  no `gh` CLI required.
+- A GitHub token with access to the repo's issues and pull requests. nightshift
+  talks to the GitHub REST API directly — no `gh` CLI required.
 
-  ```
-  export GITHUB_TOKEN=ghp_...        # a personal access token
-  ```
+  A fine-grained token needs **Issues: read** and **Pull requests: read/write**
+  (Metadata: read is implied) on the target repo; a classic token needs `repo`
+  (or `public_repo` for a public repo). The branch is pushed over SSH, so the
+  token does not need Contents access unless your `origin` uses HTTPS.
 
-  A fine-grained token needs Contents (read/write), Pull requests (read/write),
-  and Issues (read) on the target repo; a classic token needs `repo`.
+### Providing the token
+
+nightshift looks for a token in this order:
+
+1. The `--token` flag (one-off override).
+2. `GITHUB_TOKEN`, then `GH_TOKEN` (handy for CI).
+3. A saved token at `~/.config/nightshift/token` (mode `0600`).
+4. An interactive prompt (input is hidden), which offers to save it for next time.
+
+So the first interactive run just prompts you once and remembers it. If a saved
+token later expires or is revoked, nightshift detects the rejection, explains,
+re-prompts, and overwrites the stored token. Remove a saved token with:
+
+```
+nightshift --logout
+```
 
 ## Build
 

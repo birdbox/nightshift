@@ -12,6 +12,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -24,6 +25,7 @@ import (
 
 	"github.com/birdbox/nightshift/internal/github"
 	"github.com/birdbox/nightshift/internal/runner"
+	"github.com/birdbox/nightshift/internal/secret"
 )
 
 const version = "0.1.0-dev"
@@ -48,6 +50,8 @@ func run() error {
 		keep         = flag.Bool("keep", false, "keep worktrees after running instead of removing them")
 		worktreeRoot = flag.String("worktree-root", "", "parent directory for worktrees (default: a temp dir)")
 		concurrency  = flag.Int("concurrency", 3, "max issues to work on at once")
+		token        = flag.String("token", "", "GitHub token to use for this run (overrides env and saved token)")
+		logout       = flag.Bool("logout", false, "delete the saved GitHub token and exit")
 		showVersion  = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Usage = usage
@@ -55,6 +59,15 @@ func run() error {
 
 	if *showVersion {
 		fmt.Println("nightshift " + version)
+		return nil
+	}
+
+	if *logout {
+		if err := secret.Delete(); err != nil {
+			return fmt.Errorf("remove saved token: %w", err)
+		}
+		p, _ := secret.Path()
+		fmt.Printf("Removed any saved token (%s).\n", p)
 		return nil
 	}
 
@@ -67,7 +80,7 @@ func run() error {
 		return err
 	}
 
-	client, err := github.NewClient(ctx, repoDir)
+	client, err := authenticate(ctx, repoDir, *token)
 	if err != nil {
 		return err
 	}
@@ -225,6 +238,97 @@ func runPool(ctx context.Context, issues []github.Issue, opts runner.Options, co
 	return nil
 }
 
+// authenticate resolves a GitHub token and returns a verified client. It tries,
+// in order: the --token flag, GITHUB_TOKEN/GH_TOKEN, the saved token file, and
+// finally an interactive prompt. If a saved or entered token is rejected (e.g.
+// expired or revoked), it explains and re-prompts, then overwrites the stored
+// token with the working one.
+func authenticate(ctx context.Context, repoDir, tokenFlag string) (*github.Client, error) {
+	if tokenFlag != "" {
+		return newClientChecked(ctx, repoDir, tokenFlag, "the --token flag")
+	}
+	if t := os.Getenv("GITHUB_TOKEN"); t != "" {
+		return newClientChecked(ctx, repoDir, t, "the GITHUB_TOKEN environment variable")
+	}
+	if t := os.Getenv("GH_TOKEN"); t != "" {
+		return newClientChecked(ctx, repoDir, t, "the GH_TOKEN environment variable")
+	}
+
+	saved, err := secret.Load()
+	if err != nil {
+		return nil, fmt.Errorf("read saved token: %w", err)
+	}
+	token := saved
+	fromFile := saved != ""
+	prompted := false
+
+	for {
+		if token == "" {
+			if !secret.Interactive() {
+				p, _ := secret.Path()
+				return nil, fmt.Errorf("no GitHub token found; set GITHUB_TOKEN or save one at %s (run interactively to be prompted)", p)
+			}
+			fmt.Println("nightshift needs a GitHub token (issues: read, pull requests: write).")
+			t, err := secret.PromptToken("Token: ")
+			if err != nil {
+				return nil, fmt.Errorf("read token: %w", err)
+			}
+			if t == "" {
+				return nil, fmt.Errorf("no token entered")
+			}
+			token, fromFile, prompted = t, false, true
+		}
+
+		client, err := github.NewClient(ctx, repoDir, token)
+		if err == nil {
+			if prompted {
+				maybeSave(token)
+			}
+			return client, nil
+		}
+
+		// Only a credential rejection is worth re-prompting for; other errors
+		// (network, not a GitHub repo, missing scope) won't be fixed by retrying.
+		if errors.Is(err, github.ErrBadCredentials) && secret.Interactive() {
+			if fromFile {
+				fmt.Println("Your saved GitHub token was rejected (expired or revoked). Let's set a new one.")
+			} else {
+				fmt.Println("That token was rejected. Try again.")
+			}
+			token = ""
+			continue
+		}
+		return nil, err
+	}
+}
+
+// newClientChecked builds a client and, on a credential rejection, returns a
+// message naming where the bad token came from instead of re-prompting (the
+// source is non-interactive, so the user must fix it themselves).
+func newClientChecked(ctx context.Context, repoDir, token, source string) (*github.Client, error) {
+	client, err := github.NewClient(ctx, repoDir, token)
+	if err != nil {
+		if errors.Is(err, github.ErrBadCredentials) {
+			return nil, fmt.Errorf("the GitHub token in %s is invalid or expired — update or unset it", source)
+		}
+		return nil, err
+	}
+	return client, nil
+}
+
+// maybeSave offers to persist a freshly entered, working token.
+func maybeSave(token string) {
+	p, _ := secret.Path()
+	if !confirmDefault(fmt.Sprintf("Save this token to %s for next time?", p), true) {
+		return
+	}
+	if err := secret.Save(token); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not save token: %v\n", err)
+		return
+	}
+	fmt.Println("Saved. nightshift will reuse it (remove it with `nightshift --logout`).")
+}
+
 // selectIssues resolves the issues to act on. Explicit issue numbers as
 // positional args bypass the filters; otherwise the filters apply.
 func selectIssues(ctx context.Context, client *github.Client, args []string, assignee, label, state string, limit int) ([]github.Issue, string, error) {
@@ -277,13 +381,22 @@ func printIssues(issues []github.Issue) {
 	}
 }
 
-func confirm(prompt string) bool {
-	fmt.Printf("%s [y/N] ", prompt)
+func confirm(prompt string) bool { return confirmDefault(prompt, false) }
+
+func confirmDefault(prompt string, def bool) bool {
+	hint := "[y/N]"
+	if def {
+		hint = "[Y/n]"
+	}
+	fmt.Printf("%s %s ", prompt, hint)
 	scanner := bufio.NewScanner(os.Stdin)
 	if !scanner.Scan() {
-		return false
+		return def
 	}
 	answer := strings.ToLower(strings.TrimSpace(scanner.Text()))
+	if answer == "" {
+		return def
+	}
 	return answer == "y" || answer == "yes"
 }
 
