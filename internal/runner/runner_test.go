@@ -4,9 +4,57 @@
 package runner
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
+
+func TestOutcomeComment(t *testing.T) {
+	tests := []struct {
+		name string
+		res  Result
+		want string // substring the comment must contain
+	}{
+		{
+			name: "error reports the failure reason",
+			res:  Result{Err: errors.New("claude execution: exit status 1")},
+			want: "exit status 1",
+		},
+		{
+			name: "success reports the PR URL",
+			res:  Result{PRURL: "https://github.com/birdbox/nightshift/pull/42"},
+			want: "https://github.com/birdbox/nightshift/pull/42",
+		},
+		{
+			name: "no PR reports the note",
+			res:  Result{Note: "agent produced no commits; no PR opened"},
+			want: "no commits",
+		},
+		{
+			name: "no PR and no note still produces a comment",
+			res:  Result{},
+			want: "no pull request",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := outcomeComment(tt.res)
+			if got == "" {
+				t.Fatal("outcomeComment returned empty string")
+			}
+			if !strings.Contains(got, tt.want) {
+				t.Errorf("outcomeComment(%+v) = %q, want it to contain %q", tt.res, got, tt.want)
+			}
+		})
+	}
+
+	// An error takes precedence over any PR URL that may also be set.
+	got := outcomeComment(Result{Err: errors.New("push failed"), PRURL: "https://x/pull/1"})
+	if !strings.Contains(got, "push failed") || strings.Contains(got, "pull/1") {
+		t.Errorf("error outcome should report the error, not a PR URL; got %q", got)
+	}
+}
 
 func TestBranchSlug(t *testing.T) {
 	tests := []struct {

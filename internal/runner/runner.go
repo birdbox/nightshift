@@ -33,6 +33,12 @@ type Options struct {
 	WorktreeRoot string         // parent directory under which worktrees and logs live
 	Keep         bool           // keep worktrees after running instead of removing them
 	Stream       bool           // also tee output to stdout (used when running one at a time)
+
+	// WriteBack opts into mutating the issue: a comment summarizing the outcome
+	// (PR URL on success, failure reason on error) and, if InProgressLabel is
+	// set, that label is applied while the agent works and removed afterward.
+	WriteBack       bool
+	InProgressLabel string
 }
 
 // Result reports the outcome of executing a single issue.
@@ -71,9 +77,15 @@ func Execute(ctx context.Context, iss github.Issue, opts Options) Result {
 	logPath := filepath.Join(opts.WorktreeRoot, fmt.Sprintf("issue-%d.log", iss.Number))
 
 	res := Result{Issue: iss, Branch: branch, LogPath: logPath}
+	// out is the run's log sink; it stays io.Discard until the log file exists so
+	// the finish closure (captured below) can always write to it safely.
+	var out io.Writer = io.Discard
 	finish := func(err error) Result {
 		res.Err = err
 		res.Elapsed = time.Since(start)
+		if opts.WriteBack {
+			commentOutcome(out, opts, iss, res)
+		}
 		return res
 	}
 
@@ -83,7 +95,7 @@ func Execute(ctx context.Context, iss github.Issue, opts Options) Result {
 	}
 	defer logFile.Close()
 
-	var out io.Writer = logFile
+	out = logFile
 	if opts.Stream {
 		out = io.MultiWriter(logFile, os.Stdout)
 	}
@@ -104,6 +116,23 @@ func Execute(ctx context.Context, iss github.Issue, opts Options) Result {
 			// Use a fresh context so cleanup still runs if ctx was canceled.
 			if err := git.RemoveWorktree(context.Background(), opts.RepoDir, worktreePath); err != nil {
 				fmt.Fprintf(out, "warning: could not remove worktree: %v\n", err)
+			}
+		}()
+	}
+
+	// Mark the issue in-progress while the agent works, and clear the marker when
+	// done so it never lingers after the run. Best effort: a labeling failure must
+	// not abort otherwise-good work.
+	if opts.WriteBack && opts.InProgressLabel != "" {
+		if err := opts.Client.AddLabels(ctx, iss.Number, opts.InProgressLabel); err != nil {
+			fmt.Fprintf(out, "warning: could not add label %q to issue #%d: %v\n", opts.InProgressLabel, iss.Number, err)
+		}
+		defer func() {
+			// Fresh context so the label is cleared even if ctx was canceled.
+			rctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := opts.Client.RemoveLabel(rctx, iss.Number, opts.InProgressLabel); err != nil {
+				fmt.Fprintf(out, "warning: could not remove label %q from issue #%d: %v\n", opts.InProgressLabel, iss.Number, err)
 			}
 		}()
 	}
@@ -141,6 +170,35 @@ func Execute(ctx context.Context, iss github.Issue, opts Options) Result {
 func logErr(out io.Writer, err error) error {
 	fmt.Fprintf(out, "\nERROR: %v\n", err)
 	return err
+}
+
+// commentOutcome posts a comment on the issue summarizing how the run ended.
+// It uses a fresh context so the comment lands even when the run's context was
+// canceled, and only logs (never returns) its own failures — write-back is a
+// courtesy that must not change the run's result.
+func commentOutcome(out io.Writer, opts Options, iss github.Issue, res Result) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := opts.Client.CommentOnIssue(ctx, iss.Number, outcomeComment(res)); err != nil {
+		fmt.Fprintf(out, "warning: could not comment on issue #%d: %v\n", iss.Number, err)
+	}
+}
+
+// outcomeComment renders the issue comment body for a finished run: the PR URL
+// on success, the failure reason on error, or the no-PR note otherwise.
+func outcomeComment(res Result) string {
+	switch {
+	case res.Err != nil:
+		return fmt.Sprintf("🌙 nightshift could not complete this issue:\n\n```\n%v\n```", res.Err)
+	case res.PRURL != "":
+		return fmt.Sprintf("🌙 nightshift opened a pull request: %s", res.PRURL)
+	default:
+		note := res.Note
+		if note == "" {
+			note = "no pull request was opened"
+		}
+		return fmt.Sprintf("🌙 nightshift ran but opened no pull request (%s).", note)
+	}
 }
 
 func runClaude(ctx context.Context, worktreePath string, opts Options, iss github.Issue, branch string, out io.Writer) error {

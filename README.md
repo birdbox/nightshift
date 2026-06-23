@@ -54,6 +54,8 @@ issue that already has an open PR is **skipped** (and shown with its PR in
 - `--execute` — actually run Claude (otherwise dry run).
 - `--yes` — skip the confirmation prompt.
 - `--force` — act on issues even if they already have an open PR.
+- `--update-issues` — write back to each issue: comment the outcome and toggle an in-progress label (see below). Off by default.
+- `--in-progress-label <name>` — label applied while working and removed after, with `--update-issues` (default `nightshift:in-progress`; empty disables labeling).
 - `--concurrency <n>` — how many issues to work on at once (default 3).
 - `--base <branch>` — base branch to branch from / target PRs at (default: repo default branch).
 - `--model <name>` — Claude model alias or full name (default: claude's own default).
@@ -65,6 +67,23 @@ is told to read the repo's own `CLAUDE.md`/build config, run its own checks, and
 commit — then **nightshift** pushes the branch and opens the PR (with `Closes
 #<n>`) via the GitHub API. If the agent produces no commits, no PR is opened.
 Ctrl+C cancels in-flight agents and cleans up their worktrees.
+
+### Writing back to issues
+
+By default nightshift only *reads* issues and opens PRs — it never mutates the
+issues themselves. Pass `--update-issues` to opt into write-back:
+
+- **While working**, the issue is labeled `nightshift:in-progress` (override with
+  `--in-progress-label`, or pass an empty value to skip labeling). The label is
+  removed when the run finishes, however it ends.
+- **When done**, nightshift comments the outcome on the issue: the pull-request
+  URL on success, the failure reason on error, or a short note when the agent
+  produced no PR.
+
+Write-back is best-effort and never changes a run's result: if a comment or label
+call fails (or the token lacks issue-write access), nightshift logs a warning and
+carries on. It also requires a token with **Issues: write** (the read-only
+default is enough without `--update-issues`).
 
 ### Concurrency and logs
 
@@ -104,7 +123,8 @@ location.
   A fine-grained token needs **Issues: read** and **Pull requests: read/write**
   (Metadata: read is implied) on the target repo; a classic token needs `repo`
   (or `public_repo` for a public repo). The branch is pushed over SSH, so the
-  token does not need Contents access unless your `origin` uses HTTPS.
+  token does not need Contents access unless your `origin` uses HTTPS. Using
+  `--update-issues` additionally requires **Issues: write**.
 
 ### Providing the token
 
