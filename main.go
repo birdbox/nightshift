@@ -30,7 +30,9 @@ import (
 	"github.com/birdbox/nightshift/internal/secret"
 )
 
-const version = "0.1.0-dev"
+// version is the build version. It defaults to "dev" and can be overridden at
+// build time with `go build -ldflags "-X main.version=<v>"`.
+var version = "dev"
 
 func main() {
 	if err := run(); err != nil {

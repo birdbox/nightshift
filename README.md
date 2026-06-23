@@ -112,11 +112,89 @@ re-prompts, and overwrites the stored token. Remove a saved token with:
 nightshift --logout
 ```
 
-## Build
+## Building
 
-```
+A plain build produces a binary reporting version `dev`:
+
+```sh
 go build -o nightshift .
 ```
+
+To stamp a real version, use the Makefile, which derives it from git
+(`git describe --tags --always --dirty`, falling back to `dev`):
+
+```sh
+make build
+./nightshift --version      # e.g. nightshift v0.2.0
+```
+
+The version is injected at link time via `-ldflags "-X main.version=<v>"`.
+Override it explicitly if needed:
+
+```sh
+make build VERSION=1.2.3
+# or directly:
+go build -ldflags "-X main.version=1.2.3" .
+```
+
+Other Makefile targets: `make test` (runs `go test ./...`) and `make install`
+(version-stamped `go install`).
+
+## Cross-platform builds
+
+nightshift is pure Go (standard library only, no cgo), so it cross-compiles to a
+single static binary for any target using just `GOOS`/`GOARCH` — no C toolchain
+required. Setting `CGO_ENABLED=0` guarantees a fully static binary.
+
+Supported targets:
+
+| OS    | Arch          | `GOOS`   | `GOARCH` |
+| ----- | ------------- | -------- | -------- |
+| Linux | x86-64        | `linux`  | `amd64`  |
+| Linux | ARM64         | `linux`  | `arm64`  |
+| macOS | Intel         | `darwin` | `amd64`  |
+| macOS | Apple Silicon | `darwin` | `arm64`  |
+
+Build a single target, e.g. Linux ARM64:
+
+```sh
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+  go build -ldflags "-X main.version=$(git describe --tags --always --dirty)" \
+  -o dist/nightshift-linux-arm64 .
+```
+
+> **Windows** is not supported yet. It compiles (`GOOS=windows`), but nightshift
+> shells out to `stty` for hidden token entry, which doesn't exist on Windows, so
+> the token prompt would echo. Untested otherwise.
+
+## Releases
+
+A release is a git tag plus one binary per target. The build stamps the version
+from the tag automatically.
+
+1. Tag and push:
+
+   ```sh
+   git tag v0.2.0
+   git push origin v0.2.0
+   ```
+
+2. Build the matrix:
+
+   ```sh
+   VERSION=$(git describe --tags --always --dirty)
+   LDFLAGS="-X main.version=$VERSION"
+   mkdir -p dist
+   for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+     os=${target%/*}; arch=${target#*/}
+     CGO_ENABLED=0 GOOS=$os GOARCH=$arch \
+       go build -ldflags "$LDFLAGS" -o "dist/nightshift-$VERSION-$os-$arch" .
+   done
+   (cd dist && sha256sum nightshift-* > SHA256SUMS)
+   ```
+
+3. Upload everything in `dist/` (binaries + `SHA256SUMS`) to the GitHub release
+   for the tag.
 
 ## Roadmap
 
