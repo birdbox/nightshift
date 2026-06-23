@@ -25,6 +25,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/birdbox/nightshift/internal/git"
 	"github.com/birdbox/nightshift/internal/github"
 	"github.com/birdbox/nightshift/internal/runner"
 	"github.com/birdbox/nightshift/internal/secret"
@@ -64,6 +65,7 @@ func runExec() error {
 		force        = flag.Bool("force", false, "act on issues even if they already have an open PR")
 		token        = flag.String("token", "", "GitHub token to use for this run (overrides env and saved token)")
 		logout       = flag.Bool("logout", false, "delete the saved GitHub token and exit")
+		clean        = flag.Bool("clean", false, "remove this repo's nightshift worktree root (logs and leftover worktrees) and exit")
 		showVersion  = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Usage = usage
@@ -99,6 +101,10 @@ func runExec() error {
 	repoDir, err := os.Getwd()
 	if err != nil {
 		return err
+	}
+
+	if *clean {
+		return cleanWorktreeRoot(ctx, repoDir, *worktreeRoot)
 	}
 
 	client, err := authenticate(ctx, repoDir, *token)
@@ -166,6 +172,58 @@ func runExec() error {
 	})
 }
 
+// defaultWorktreeRoot returns the temp directory nightshift uses for a repo's
+// worktrees and per-issue logs when --worktree-root is not given.
+func defaultWorktreeRoot(repoName string) string {
+	return filepath.Join(os.TempDir(), "nightshift", repoName)
+}
+
+// cleanWorktreeRoot deletes this repo's nightshift worktree root — the per-issue
+// logs and any leftover worktrees from past runs — and prints what it removed.
+// With no --worktree-root it targets the default temp location for the repo
+// whose origin remote lives in repoDir.
+func cleanWorktreeRoot(ctx context.Context, repoDir, worktreeRoot string) error {
+	root := worktreeRoot
+	if root == "" {
+		_, name, err := github.RepoSlug(ctx, repoDir)
+		if err != nil {
+			return fmt.Errorf("determine worktree root (set --worktree-root): %w", err)
+		}
+		root = defaultWorktreeRoot(name)
+	}
+
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		fmt.Printf("Nothing to clean: %s does not exist.\n", root)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read worktree root: %w", err)
+	}
+
+	if err := os.RemoveAll(root); err != nil {
+		return fmt.Errorf("remove worktree root: %w", err)
+	}
+	// The worktrees were force-removed out from under git; drop its now-dangling
+	// administrative references. Best effort — the directory is already gone.
+	if err := git.PruneWorktrees(ctx, repoDir); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: git worktree prune: %v\n", err)
+	}
+
+	fmt.Printf("Removed %s\n", root)
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() {
+			name += "/"
+		}
+		fmt.Printf("  %s\n", name)
+	}
+	if len(entries) == 0 {
+		fmt.Println("  (was empty)")
+	}
+	return nil
+}
+
 type execConfig struct {
 	base         string
 	model        string
@@ -195,7 +253,7 @@ func execIssues(ctx context.Context, client *github.Client, repoDir string, issu
 		if i := strings.LastIndex(slug, "/"); i >= 0 {
 			name = slug[i+1:]
 		}
-		worktreeRoot = filepath.Join(os.TempDir(), "nightshift", name)
+		worktreeRoot = defaultWorktreeRoot(name)
 	}
 	if err := os.MkdirAll(worktreeRoot, 0o755); err != nil {
 		return fmt.Errorf("create worktree root: %w", err)

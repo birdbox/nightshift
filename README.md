@@ -83,6 +83,17 @@ Done. 1 succeeded, 1 failed.
 
 With `--concurrency 1`, output is also teed live to the console.
 
+These logs (and any leftover worktrees) accumulate under the worktree root and
+are never removed automatically. Clear them with:
+
+```
+nightshift --clean
+```
+
+This deletes this repo's worktree root, prunes git's stale worktree entries, and
+prints what it removed. Pass `--worktree-root <dir>` to clean a non-default
+location.
+
 ## Requirements
 
 - `git` (with push access to the repo's `origin`, e.g. an SSH key).

@@ -74,6 +74,17 @@ func NewClient(ctx context.Context, repoDir, token string) (*Client, error) {
 // Slug returns the "owner/name" of the client's repository.
 func (c *Client) Slug() string { return c.owner + "/" + c.repo }
 
+// RepoSlug returns the owner and name of the repository whose origin remote
+// lives in repoDir, without authenticating. It lets commands that only need the
+// repo identity (not API access) avoid a token round-trip.
+func RepoSlug(ctx context.Context, repoDir string) (owner, name string, err error) {
+	remote, err := git.RemoteURL(ctx, repoDir, "origin")
+	if err != nil {
+		return "", "", fmt.Errorf("read origin remote: %w", err)
+	}
+	return parseSlug(remote)
+}
+
 // parseSlug extracts owner/repo from an SSH or HTTPS GitHub remote URL.
 func parseSlug(remote string) (owner, repo string, err error) {
 	s := strings.TrimSpace(remote)
