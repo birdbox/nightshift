@@ -16,12 +16,29 @@ Claude Code on each one in an isolated worktree to open a PR. Without
 `--execute` it's a dry run that reports what it would do.
 
 ```
+nightshift list            # show issues in a table (read-only)
+nightshift list --state all --assignee ""
+
 nightshift                 # dry run: issues assigned to you (@me), open
 nightshift --label nightshift
 nightshift 1234 1240       # specific issue numbers (bypass filters)
 
 nightshift --execute       # create a worktree per issue and run Claude
 nightshift --execute --yes # ...without the confirmation prompt
+```
+
+### `nightshift list`
+
+A read-only, tabular view of issues — never creates worktrees or PRs. Takes the
+same selection flags (`--assignee`, `--label`, `--state`, `--limit`) and accepts
+explicit issue numbers:
+
+```
+birdbox/nightshift — state=open, assignee=@me
+
+#   STATE  AGE  TITLE                                  LABELS
+#4  open   2h   fix: validate --state with a clear error
+#2  open   3d   feat: add --clean flag to prune old worktree logs
 ```
 
 ### Execution flags

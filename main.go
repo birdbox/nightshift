@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"text/tabwriter"
 	"time"
 
 	"github.com/birdbox/nightshift/internal/github"
@@ -37,7 +38,16 @@ func main() {
 	}
 }
 
+// run dispatches subcommands; anything that isn't a known subcommand falls
+// through to the default execute/dry-run behavior.
 func run() error {
+	if len(os.Args) > 1 && os.Args[1] == "list" {
+		return cmdList(os.Args[2:])
+	}
+	return runExec()
+}
+
+func runExec() error {
 	var (
 		assignee     = flag.String("assignee", "@me", "filter issues by assignee (gh syntax: @me, a login, or empty for any)")
 		label        = flag.String("label", "", "filter issues by label")
@@ -380,6 +390,86 @@ func selectIssues(ctx context.Context, client *github.Client, args []string, ass
 	return issues, strings.Join(parts, ", "), nil
 }
 
+// cmdList implements `nightshift list`: a read-only, tabular view of issues.
+func cmdList(argv []string) error {
+	fs := flag.NewFlagSet("list", flag.ExitOnError)
+	assignee := fs.String("assignee", "@me", "filter by assignee (@me, a login, or empty for any)")
+	label := fs.String("label", "", "filter by label")
+	state := fs.String("state", "open", "issue state: open, closed, all")
+	limit := fs.Int("limit", 20, "max issues to show")
+	token := fs.String("token", "", "GitHub token to use (overrides env and saved token)")
+	fs.Usage = func() {
+		fmt.Fprint(os.Stderr, "nightshift list — show issues without running anything\n\n"+
+			"Usage:\n  nightshift list [flags] [issue numbers...]\n\nFlags:\n")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(argv); err != nil {
+		return err
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	repoDir, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	client, err := authenticate(ctx, repoDir, *token)
+	if err != nil {
+		return err
+	}
+
+	issues, selection, err := selectIssues(ctx, client, fs.Args(), *assignee, *label, *state, *limit)
+	if err != nil {
+		return err
+	}
+	printIssueList(client.Slug(), selection, issues)
+	return nil
+}
+
+// printIssueList renders issues as an aligned table.
+func printIssueList(slug, selection string, issues []github.Issue) {
+	fmt.Printf("%s — %s\n\n", slug, selection)
+	if len(issues) == 0 {
+		fmt.Println("No matching issues.")
+		return
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "#\tSTATE\tAGE\tTITLE\tLABELS")
+	for _, iss := range issues {
+		fmt.Fprintf(w, "#%d\t%s\t%s\t%s\t%s\n",
+			iss.Number, iss.State, humanizeAge(iss.CreatedAt), truncate(iss.Title, 60), iss.LabelNames())
+	}
+	w.Flush()
+	fmt.Printf("\n%d issue(s).\n", len(issues))
+}
+
+// humanizeAge renders how long ago t was, compactly (e.g. "3d", "5h").
+func humanizeAge(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	switch d := time.Since(t); {
+	case d < time.Minute:
+		return "now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd", int(d.Hours()/24))
+	}
+}
+
+// truncate shortens s to at most n runes, adding an ellipsis when cut.
+func truncate(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n-1]) + "…"
+}
+
 func printIssues(issues []github.Issue) {
 	for _, iss := range issues {
 		fmt.Printf("\n  #%-5d %s\n", iss.Number, iss.Title)
@@ -413,7 +503,8 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `nightshift %s — autonomous ticket-execution harness
 
 Usage:
-  nightshift [flags] [issue numbers...]
+  nightshift [flags] [issue numbers...]   select issues and (with --execute) run agents
+  nightshift list [flags]                 show issues in a table, run nothing
 
 Run inside a git repository. With no issue numbers, nightshift selects issues
 using the filter flags. With issue numbers, it acts on exactly those. Without

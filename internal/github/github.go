@@ -177,13 +177,14 @@ type User struct {
 
 // Issue is the subset of a GitHub issue nightshift cares about.
 type Issue struct {
-	Number    int     `json:"number"`
-	Title     string  `json:"title"`
-	URL       string  `json:"html_url"`
-	State     string  `json:"state"`
-	Body      string  `json:"body"`
-	Labels    []Label `json:"labels"`
-	Assignees []User  `json:"assignees"`
+	Number    int       `json:"number"`
+	Title     string    `json:"title"`
+	URL       string    `json:"html_url"`
+	State     string    `json:"state"`
+	CreatedAt time.Time `json:"created_at"`
+	Body      string    `json:"body"`
+	Labels    []Label   `json:"labels"`
+	Assignees []User    `json:"assignees"`
 	// PullRequest is set by the API when this "issue" is actually a PR.
 	PullRequest *struct{} `json:"pull_request,omitempty"`
 }
