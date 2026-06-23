@@ -41,10 +41,19 @@ birdbox/nightshift — state=open, assignee=@me
 #2  open   3d   feat: add --clean flag to prune old worktree logs
 ```
 
+### Avoiding duplicate work
+
+Before acting, nightshift fetches open pull requests and links them back to
+issues — both by its own branch convention (`nightshift/issue-<n>-…`) and by
+closing keywords (`Closes #<n>`) in PR bodies, so human-made PRs count too. Any
+issue that already has an open PR is **skipped** (and shown with its PR in
+`list` and dry-run output). Override with `--force` to run anyway.
+
 ### Execution flags
 
 - `--execute` — actually run Claude (otherwise dry run).
 - `--yes` — skip the confirmation prompt.
+- `--force` — act on issues even if they already have an open PR.
 - `--concurrency <n>` — how many issues to work on at once (default 3).
 - `--base <branch>` — base branch to branch from / target PRs at (default: repo default branch).
 - `--model <name>` — Claude model alias or full name (default: claude's own default).

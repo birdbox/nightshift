@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -60,6 +61,7 @@ func runExec() error {
 		keep         = flag.Bool("keep", false, "keep worktrees after running instead of removing them")
 		worktreeRoot = flag.String("worktree-root", "", "parent directory for worktrees (default: a temp dir)")
 		concurrency  = flag.Int("concurrency", 3, "max issues to work on at once")
+		force        = flag.Bool("force", false, "act on issues even if they already have an open PR")
 		token        = flag.String("token", "", "GitHub token to use for this run (overrides env and saved token)")
 		logout       = flag.Bool("logout", false, "delete the saved GitHub token and exit")
 		showVersion  = flag.Bool("version", false, "print version and exit")
@@ -109,14 +111,39 @@ func runExec() error {
 		return err
 	}
 
+	prByIssue, err := openPRsByIssue(ctx, client)
+	if err != nil {
+		return err
+	}
+
 	fmt.Printf("Repository: %s\n", client.Slug())
 	fmt.Printf("Selection:  %s\n", selection)
 	fmt.Printf("Found %d issue(s).\n", len(issues))
-	printIssues(issues)
+	printIssues(issues, prByIssue)
 
 	if len(issues) == 0 {
 		fmt.Println("\nNothing to do.")
 		return nil
+	}
+
+	// Skip issues that already have an open PR, unless --force.
+	actionable := issues
+	if !*force {
+		var act, skip []github.Issue
+		for _, iss := range issues {
+			if _, ok := prByIssue[iss.Number]; ok {
+				skip = append(skip, iss)
+			} else {
+				act = append(act, iss)
+			}
+		}
+		actionable = act
+		if len(skip) > 0 {
+			fmt.Printf("\nSkipping %d issue(s) with an open PR (use --force to run anyway):\n", len(skip))
+			for _, iss := range skip {
+				fmt.Printf("  #%d → %s\n", iss.Number, prByIssue[iss.Number].URL)
+			}
+		}
 	}
 
 	if !*execute {
@@ -124,7 +151,12 @@ func runExec() error {
 		return nil
 	}
 
-	return execIssues(ctx, client, repoDir, issues, execConfig{
+	if len(actionable) == 0 {
+		fmt.Println("\nNothing to do.")
+		return nil
+	}
+
+	return execIssues(ctx, client, repoDir, actionable, execConfig{
 		base:         *base,
 		model:        *model,
 		worktreeRoot: *worktreeRoot,
@@ -348,6 +380,47 @@ func maybeSave(token string) {
 	fmt.Println("Saved. nightshift will reuse it (remove it with `nightshift --logout`).")
 }
 
+var (
+	// branchIssueRE matches nightshift's own branch naming, e.g. nightshift/issue-12-foo.
+	branchIssueRE = regexp.MustCompile(`^nightshift/issue-(\d+)-`)
+	// closesRE matches GitHub's closing keywords, e.g. "Closes #12", "fixes #3".
+	closesRE = regexp.MustCompile(`(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)`)
+)
+
+// openPRsByIssue maps issue numbers to an open PR addressing them, so nightshift
+// can avoid acting on issues that already have work in flight.
+func openPRsByIssue(ctx context.Context, client *github.Client) (map[int]github.PullRequest, error) {
+	prs, err := client.ListOpenPRs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return mapPRsToIssues(prs), nil
+}
+
+// mapPRsToIssues links each open PR to the issue(s) it addresses, via nightshift's
+// branch convention and any closing keyword in the PR body.
+func mapPRsToIssues(prs []github.PullRequest) map[int]github.PullRequest {
+	m := make(map[int]github.PullRequest)
+	for _, pr := range prs {
+		add := func(n int) {
+			if _, ok := m[n]; !ok {
+				m[n] = pr
+			}
+		}
+		if mt := branchIssueRE.FindStringSubmatch(pr.Head.Ref); mt != nil {
+			if n, err := strconv.Atoi(mt[1]); err == nil {
+				add(n)
+			}
+		}
+		for _, mt := range closesRE.FindAllStringSubmatch(pr.Body, -1) {
+			if n, err := strconv.Atoi(mt[1]); err == nil {
+				add(n)
+			}
+		}
+	}
+	return m
+}
+
 // selectIssues resolves the issues to act on. Explicit issue numbers as
 // positional args bypass the filters; otherwise the filters apply.
 func selectIssues(ctx context.Context, client *github.Client, args []string, assignee, label, state string, limit int) ([]github.Issue, string, error) {
@@ -423,22 +496,30 @@ func cmdList(argv []string) error {
 	if err != nil {
 		return err
 	}
-	printIssueList(client.Slug(), selection, issues)
+	prByIssue, err := openPRsByIssue(ctx, client)
+	if err != nil {
+		return err
+	}
+	printIssueList(client.Slug(), selection, issues, prByIssue)
 	return nil
 }
 
-// printIssueList renders issues as an aligned table.
-func printIssueList(slug, selection string, issues []github.Issue) {
+// printIssueList renders issues as an aligned table, marking ones with an open PR.
+func printIssueList(slug, selection string, issues []github.Issue, prs map[int]github.PullRequest) {
 	fmt.Printf("%s — %s\n\n", slug, selection)
 	if len(issues) == 0 {
 		fmt.Println("No matching issues.")
 		return
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "#\tSTATE\tAGE\tTITLE\tLABELS")
+	fmt.Fprintln(w, "#\tSTATE\tPR\tAGE\tTITLE\tLABELS")
 	for _, iss := range issues {
-		fmt.Fprintf(w, "#%d\t%s\t%s\t%s\t%s\n",
-			iss.Number, iss.State, humanizeAge(iss.CreatedAt), truncate(iss.Title, 60), iss.LabelNames())
+		pr := "-"
+		if p, ok := prs[iss.Number]; ok {
+			pr = fmt.Sprintf("#%d", p.Number)
+		}
+		fmt.Fprintf(w, "#%d\t%s\t%s\t%s\t%s\t%s\n",
+			iss.Number, iss.State, pr, humanizeAge(iss.CreatedAt), truncate(iss.Title, 60), iss.LabelNames())
 	}
 	w.Flush()
 	fmt.Printf("\n%d issue(s).\n", len(issues))
@@ -470,11 +551,14 @@ func truncate(s string, n int) string {
 	return string(r[:n-1]) + "…"
 }
 
-func printIssues(issues []github.Issue) {
+func printIssues(issues []github.Issue, prs map[int]github.PullRequest) {
 	for _, iss := range issues {
 		fmt.Printf("\n  #%-5d %s\n", iss.Number, iss.Title)
 		if names := iss.LabelNames(); names != "" {
 			fmt.Printf("         labels: %s\n", names)
+		}
+		if pr, ok := prs[iss.Number]; ok {
+			fmt.Printf("         open PR: %s\n", pr.URL)
 		}
 		fmt.Printf("         %s\n", iss.URL)
 	}

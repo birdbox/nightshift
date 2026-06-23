@@ -292,3 +292,24 @@ func (c *Client) CreatePR(ctx context.Context, title, head, base, body string) (
 	}
 	return resp.HTMLURL, nil
 }
+
+// PullRequest is the subset of a PR nightshift needs to detect in-flight work.
+type PullRequest struct {
+	Number int    `json:"number"`
+	URL    string `json:"html_url"`
+	State  string `json:"state"`
+	Body   string `json:"body"`
+	Head   struct {
+		Ref string `json:"ref"`
+	} `json:"head"`
+}
+
+// ListOpenPRs returns the open pull requests in the repository (first 100).
+func (c *Client) ListOpenPRs(ctx context.Context) ([]PullRequest, error) {
+	var prs []PullRequest
+	path := fmt.Sprintf("/repos/%s/%s/pulls?state=open&per_page=100", c.owner, c.repo)
+	if err := c.do(ctx, http.MethodGet, path, nil, &prs); err != nil {
+		return nil, err
+	}
+	return prs, nil
+}
