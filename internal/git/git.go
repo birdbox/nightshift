@@ -33,8 +33,15 @@ func Fetch(ctx context.Context, repoDir, branch string) error {
 }
 
 // AddWorktree creates a worktree at path on a new branch based on origin/base.
+//
+// Hooks are disabled for this step (core.hooksPath points at a nonexistent
+// path) so a project's post-checkout hook can't abort worktree creation. Such
+// hooks are written for interactive dev setup — e.g. seeding a .env — and their
+// non-zero exit propagates through "git worktree add" even when the worktree
+// was created fine. nightshift's worktrees are throwaway and isolated, so we
+// skip the hooks rather than let them fail the run.
 func AddWorktree(ctx context.Context, repoDir, path, branch, base string) error {
-	_, err := run(ctx, repoDir, "worktree", "add", "-b", branch, path, "origin/"+base)
+	_, err := run(ctx, repoDir, "-c", "core.hooksPath=/dev/null", "worktree", "add", "-b", branch, path, "origin/"+base)
 	return err
 }
 
