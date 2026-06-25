@@ -6,10 +6,13 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 // newTestClient points a bare Client at an httptest server. It bypasses
@@ -189,6 +192,80 @@ func TestUpdateIssue(t *testing.T) {
 		c := newTestClient(t, srv)
 		if err := c.UpdateIssue(context.Background(), 3, IssueUpdate{}); err != nil {
 			t.Fatalf("UpdateIssue(empty): %v", err)
+		}
+	})
+}
+
+func TestIsRefsNotReadable(t *testing.T) {
+	refs422 := &apiError{StatusCode: http.StatusUnprocessableEntity, msg: `422: {"message":"Validation Failed","errors":[{"message":"not all refs are readable"}]}`}
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"transient refs 422", refs422, true},
+		{"wrapped transient 422", fmt.Errorf("create pull request: %w", refs422), true},
+		{"different 422", &apiError{StatusCode: http.StatusUnprocessableEntity, msg: "422: No commits between main and branch"}, false},
+		{"refs message but not 422", &apiError{StatusCode: http.StatusInternalServerError, msg: "not all refs are readable"}, false},
+		{"nil", nil, false},
+		{"plain error", errors.New("not all refs are readable"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isRefsNotReadable(tt.err); got != tt.want {
+				t.Errorf("isRefsNotReadable() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCreatePRRetriesOnUnreadableRefs(t *testing.T) {
+	old := prRetryDelay
+	prRetryDelay = time.Millisecond
+	t.Cleanup(func() { prRetryDelay = old })
+
+	t.Run("succeeds after transient 422s", func(t *testing.T) {
+		var attempts int
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			attempts++
+			if attempts < 3 {
+				w.WriteHeader(http.StatusUnprocessableEntity)
+				io.WriteString(w, `{"message":"Validation Failed","errors":[{"message":"not all refs are readable"}]}`)
+				return
+			}
+			w.WriteHeader(http.StatusCreated)
+			io.WriteString(w, `{"html_url":"https://github.com/birdbox/nightshift/pull/42"}`)
+		}))
+		defer srv.Close()
+
+		c := newTestClient(t, srv)
+		url, err := c.CreatePR(context.Background(), "t", "head", "main", "body")
+		if err != nil {
+			t.Fatalf("CreatePR: %v", err)
+		}
+		if attempts != 3 {
+			t.Errorf("attempts = %d, want 3", attempts)
+		}
+		if want := "https://github.com/birdbox/nightshift/pull/42"; url != want {
+			t.Errorf("url = %q, want %q", url, want)
+		}
+	})
+
+	t.Run("does not retry other 422s", func(t *testing.T) {
+		var attempts int
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			attempts++
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			io.WriteString(w, `{"message":"No commits between main and head"}`)
+		}))
+		defer srv.Close()
+
+		c := newTestClient(t, srv)
+		if _, err := c.CreatePR(context.Background(), "t", "head", "main", "body"); err == nil {
+			t.Fatal("CreatePR = nil error, want failure")
+		}
+		if attempts != 1 {
+			t.Errorf("attempts = %d, want 1 (no retry)", attempts)
 		}
 	})
 }

@@ -27,6 +27,10 @@ import (
 // can point the client at an httptest server.
 var apiBase = "https://api.github.com"
 
+// prRetryDelay is the initial backoff between CreatePR retries; a var so tests
+// can shrink it.
+var prRetryDelay = time.Second
+
 // ErrBadCredentials wraps any API response that rejected the token (HTTP 401),
 // i.e. the token is missing, invalid, expired, or revoked. Callers can detect
 // it with errors.Is to re-prompt for a fresh token.
@@ -35,6 +39,16 @@ var ErrBadCredentials = errors.New("GitHub rejected the token (invalid, expired,
 // ErrNotFound wraps any API response that reported the resource as missing
 // (HTTP 404). Callers can detect it with errors.Is to make removals idempotent.
 var ErrNotFound = errors.New("GitHub returned 404 (resource not found)")
+
+// apiError carries the HTTP status of a failed API response so callers can act
+// on a specific condition (e.g. retry a transient 422). Its message preserves
+// the full formatted error including the response body.
+type apiError struct {
+	StatusCode int
+	msg        string
+}
+
+func (e *apiError) Error() string { return e.msg }
 
 // Client is an authenticated GitHub REST client scoped to one repository.
 type Client struct {
@@ -158,7 +172,10 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 
 	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		apiErr := fmt.Errorf("GitHub API %s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(data)))
+		apiErr := &apiError{
+			StatusCode: resp.StatusCode,
+			msg:        fmt.Sprintf("GitHub API %s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(data))),
+		}
 		if resp.StatusCode == http.StatusUnauthorized {
 			return fmt.Errorf("%w: %w", ErrBadCredentials, apiErr)
 		}
@@ -307,10 +324,36 @@ func (c *Client) CreatePR(ctx context.Context, title, head, base, body string) (
 		HTMLURL string `json:"html_url"`
 	}
 	path := fmt.Sprintf("/repos/%s/%s/pulls", c.owner, c.repo)
-	if err := c.do(ctx, http.MethodPost, path, reqBody, &resp); err != nil {
-		return "", err
+
+	// GitHub occasionally can't see a just-pushed head ref yet and rejects the
+	// PR with 422 "not all refs are readable"; the ref becomes visible within a
+	// few seconds (more likely on large repos). Retry that transient case with
+	// backoff before giving up.
+	delay := prRetryDelay
+	for attempt := 0; ; attempt++ {
+		err := c.do(ctx, http.MethodPost, path, reqBody, &resp)
+		if err == nil {
+			return resp.HTMLURL, nil
+		}
+		if attempt >= 4 || !isRefsNotReadable(err) {
+			return "", err
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(delay):
+		}
+		delay *= 2
 	}
-	return resp.HTMLURL, nil
+}
+
+// isRefsNotReadable reports whether err is the transient 422 GitHub returns when
+// a freshly-pushed ref isn't yet readable by the create-PR endpoint.
+func isRefsNotReadable(err error) bool {
+	var apiErr *apiError
+	return errors.As(err, &apiErr) &&
+		apiErr.StatusCode == http.StatusUnprocessableEntity &&
+		strings.Contains(apiErr.msg, "not all refs are readable")
 }
 
 // PullRequest is the subset of a PR nightshift needs to detect in-flight work.
