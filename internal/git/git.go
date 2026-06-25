@@ -65,6 +65,22 @@ func BranchExists(ctx context.Context, repoDir, branch string) (bool, error) {
 	return false, err
 }
 
+// WorktreeExists reports whether repoDir has a worktree registered at path. A
+// leftover registration (from a run that died before cleanup) makes git refuse
+// to reuse the branch, so callers clear it before AddWorktree.
+func WorktreeExists(ctx context.Context, repoDir, path string) (bool, error) {
+	out, err := run(ctx, repoDir, "worktree", "list", "--porcelain")
+	if err != nil {
+		return false, err
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if p, ok := strings.CutPrefix(line, "worktree "); ok && p == path {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // RemoveWorktree force-removes the worktree at path (the branch is preserved).
 func RemoveWorktree(ctx context.Context, repoDir, path string) error {
 	_, err := run(ctx, repoDir, "worktree", "remove", path, "--force")
