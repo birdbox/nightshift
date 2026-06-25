@@ -107,6 +107,14 @@ func Execute(ctx context.Context, iss github.Issue, opts Options) Result {
 	if err := git.Fetch(ctx, opts.RepoDir, opts.Base); err != nil {
 		return finish(logErr(out, fmt.Errorf("fetch origin/%s: %w", opts.Base, err)))
 	}
+	// A leftover branch means a prior run for this issue didn't finish (worktree
+	// removal keeps the branch). AddWorktree resets it to a fresh base; note that
+	// so the discarded local state isn't silent.
+	if exists, err := git.BranchExists(ctx, opts.RepoDir, branch); err != nil {
+		return finish(logErr(out, fmt.Errorf("check branch %s: %w", branch, err)))
+	} else if exists {
+		fmt.Fprintf(out, "note: branch %s already exists; resetting it to origin/%s\n", branch, opts.Base)
+	}
 	if err := git.AddWorktree(ctx, opts.RepoDir, worktreePath, branch, opts.Base); err != nil {
 		return finish(logErr(out, fmt.Errorf("create worktree: %w", err)))
 	}

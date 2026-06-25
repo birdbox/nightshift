@@ -8,6 +8,7 @@ package git
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strconv"
@@ -32,7 +33,10 @@ func Fetch(ctx context.Context, repoDir, branch string) error {
 	return err
 }
 
-// AddWorktree creates a worktree at path on a new branch based on origin/base.
+// AddWorktree creates a worktree at path on the branch based on origin/base. If
+// the branch already exists (a leftover from a prior run — RemoveWorktree keeps
+// branches), it is reset to origin/base; nightshift owns these per-issue
+// branches and each run starts from a fresh base. Callers should log the reuse.
 //
 // Hooks are disabled for this step (core.hooksPath points at a nonexistent
 // path) so a project's post-checkout hook can't abort worktree creation. Such
@@ -41,8 +45,24 @@ func Fetch(ctx context.Context, repoDir, branch string) error {
 // was created fine. nightshift's worktrees are throwaway and isolated, so we
 // skip the hooks rather than let them fail the run.
 func AddWorktree(ctx context.Context, repoDir, path, branch, base string) error {
-	_, err := run(ctx, repoDir, "-c", "core.hooksPath=/dev/null", "worktree", "add", "-b", branch, path, "origin/"+base)
+	// -B (vs -b) creates or resets the branch, so a re-run reuses the leftover
+	// branch instead of failing with "a branch named '...' already exists".
+	_, err := run(ctx, repoDir, "-c", "core.hooksPath=/dev/null", "worktree", "add", "-B", branch, path, "origin/"+base)
 	return err
+}
+
+// BranchExists reports whether a local branch of the given name exists.
+func BranchExists(ctx context.Context, repoDir, branch string) (bool, error) {
+	_, err := run(ctx, repoDir, "show-ref", "--verify", "--quiet", "refs/heads/"+branch)
+	if err == nil {
+		return true, nil
+	}
+	// show-ref exits 1 when the ref is simply absent; treat only that as "no".
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, err
 }
 
 // RemoveWorktree force-removes the worktree at path (the branch is preserved).
