@@ -107,6 +107,29 @@ func Execute(ctx context.Context, iss github.Issue, opts Options) Result {
 	if err := git.Fetch(ctx, opts.RepoDir, opts.Base); err != nil {
 		return finish(logErr(out, fmt.Errorf("fetch origin/%s: %w", opts.Base, err)))
 	}
+	// A prior run that died before cleanup can leave its worktree registered at
+	// the path; git then refuses to reuse the branch ("already used by worktree
+	// at ..."). Remove it first, then prune any dangling registrations.
+	if exists, err := git.WorktreeExists(ctx, opts.RepoDir, worktreePath); err != nil {
+		return finish(logErr(out, fmt.Errorf("check worktree %s: %w", worktreePath, err)))
+	} else if exists {
+		fmt.Fprintf(out, "note: removing leftover worktree at %s\n", worktreePath)
+		if err := git.RemoveWorktree(ctx, opts.RepoDir, worktreePath); err != nil {
+			return finish(logErr(out, fmt.Errorf("remove leftover worktree: %w", err)))
+		}
+	}
+	if err := git.PruneWorktrees(ctx, opts.RepoDir); err != nil {
+		return finish(logErr(out, fmt.Errorf("prune worktrees: %w", err)))
+	}
+
+	// A leftover branch means a prior run for this issue didn't finish (worktree
+	// removal keeps the branch). AddWorktree resets it to a fresh base; note that
+	// so the discarded local state isn't silent.
+	if exists, err := git.BranchExists(ctx, opts.RepoDir, branch); err != nil {
+		return finish(logErr(out, fmt.Errorf("check branch %s: %w", branch, err)))
+	} else if exists {
+		fmt.Fprintf(out, "note: branch %s already exists; resetting it to origin/%s\n", branch, opts.Base)
+	}
 	if err := git.AddWorktree(ctx, opts.RepoDir, worktreePath, branch, opts.Base); err != nil {
 		return finish(logErr(out, fmt.Errorf("create worktree: %w", err)))
 	}
