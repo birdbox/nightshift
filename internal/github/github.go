@@ -1,440 +1,546 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Matthias Eder
-
-// Package github talks to the GitHub REST API directly over net/http so
-// nightshift needs no external CLI at runtime. Authentication uses a token from
-// the GITHUB_TOKEN (or GH_TOKEN) environment variable. The repository is
-// inferred from the origin remote of the working directory.
+// Package github
 package github
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
-	"strconv"
-	"strings"
 	"time"
-
-	"github.com/birdbox/nightshift/internal/git"
 )
 
-// apiBase is the GitHub REST API root. It is a var (not a const) only so tests
-// can point the client at an httptest server.
-var apiBase = "https://api.github.com"
+const (
+	ClientID    = "Iv23liLyaM7ECgqD9CC4"
+	Application = "ticklish-llama"
+	BaseURL     = "https://github.com"
+	apiBaseURL  = "https://api.github.com"
+)
 
-// prRetryDelay is the initial backoff between CreatePR retries; a var so tests
-// can shrink it.
-var prRetryDelay = time.Second
 
-// ErrBadCredentials wraps any API response that rejected the token (HTTP 401),
-// i.e. the token is missing, invalid, expired, or revoked. Callers can detect
-// it with errors.Is to re-prompt for a fresh token.
-var ErrBadCredentials = errors.New("GitHub rejected the token (invalid, expired, or revoked)")
-
-// ErrNotFound wraps any API response that reported the resource as missing
-// (HTTP 404). Callers can detect it with errors.Is to make removals idempotent.
-var ErrNotFound = errors.New("GitHub returned 404 (resource not found)")
-
-// apiError carries the HTTP status of a failed API response so callers can act
-// on a specific condition (e.g. retry a transient 422). Its message preserves
-// the full formatted error including the response body.
-type apiError struct {
-	StatusCode int
-	msg        string
+type DeviceCode struct {
+	DeviceCode      string `json:"device_code"`
+	UserCode        string `json:"user_code"`
+	VerificationURI string `json:"verification_uri"`
+	ExpiresIn       int    `json:"expires_in"`
+	Interval        int    `json:"interval"`
 }
 
-func (e *apiError) Error() string { return e.msg }
-
-// Client is an authenticated GitHub REST client scoped to one repository.
 type Client struct {
-	http  *http.Client
-	token string
-	owner string
-	repo  string
-	login string // authenticated user's login, used to resolve "@me"
+	http *http.Client
 }
 
-// NewClient builds a client for the repo whose origin remote lives in repoDir,
-// using the given token, and verifies the token works by calling the API. If
-// the token is rejected, the returned error wraps ErrBadCredentials.
-func NewClient(ctx context.Context, repoDir, token string) (*Client, error) {
-	if strings.TrimSpace(token) == "" {
-		return nil, fmt.Errorf("empty GitHub token")
-	}
-
-	remote, err := git.RemoteURL(ctx, repoDir, "origin")
-	if err != nil {
-		return nil, fmt.Errorf("read origin remote: %w", err)
-	}
-	owner, repo, err := parseSlug(remote)
-	if err != nil {
-		return nil, err
-	}
-
+func NewClient(ctx context.Context, accessToken string) (*Client, error) {
 	c := &Client{
-		http:  &http.Client{Timeout: 30 * time.Second},
-		token: token,
-		owner: owner,
-		repo:  repo,
+		http: &http.Client{Timeout: 30 * time.Second},
 	}
 
-	login, err := c.currentLogin(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("validate GitHub token: %w", err)
-	}
-	c.login = login
+//	login, err := c.currentUser(ctx)
+//	if err != nil {
+//		return nil, fmt.Errorf("validate GitHub token: %w", err)
+//	}
+
+
 	return c, nil
 }
 
-// Slug returns the "owner/name" of the client's repository.
-func (c *Client) Slug() string { return c.owner + "/" + c.repo }
-
-// RepoSlug returns the owner and name of the repository whose origin remote
-// lives in repoDir, without authenticating. It lets commands that only need the
-// repo identity (not API access) avoid a token round-trip.
-func RepoSlug(ctx context.Context, repoDir string) (owner, name string, err error) {
-	remote, err := git.RemoteURL(ctx, repoDir, "origin")
-	if err != nil {
-		return "", "", fmt.Errorf("read origin remote: %w", err)
+// PollToken waits for the user to approve the device code in their browser.
+// It blocks until approval, a terminal error, or ctx is cancelled.
+func PollToken(ctx context.Context, dc DeviceCode) (Credentials, error) {
+	interval := time.Duration(dc.Interval) * time.Second
+	if interval <= 0 {
+		interval = 5 * time.Second
 	}
-	return parseSlug(remote)
-}
+	deadline := time.Now().Add(time.Duration(dc.ExpiresIn) * time.Second)
 
-// parseSlug extracts owner/repo from an SSH or HTTPS GitHub remote URL.
-func parseSlug(remote string) (owner, repo string, err error) {
-	s := strings.TrimSpace(remote)
-	switch {
-	case strings.HasPrefix(s, "git@"):
-		// scp-style: git@github.com:owner/repo.git
-		at := strings.Index(s, "@")
-		colon := strings.Index(s, ":")
-		if colon < 0 {
-			return "", "", fmt.Errorf("unrecognized remote URL %q", remote)
-		}
-		if host := s[at+1 : colon]; host != "github.com" {
-			return "", "", fmt.Errorf("only github.com is supported (remote host %q)", host)
-		}
-		s = s[colon+1:]
-	case strings.HasPrefix(s, "ssh://"), strings.HasPrefix(s, "https://"), strings.HasPrefix(s, "http://"):
-		u, err := url.Parse(s)
-		if err != nil {
-			return "", "", fmt.Errorf("parse remote URL %q: %w", remote, err)
-		}
-		if u.Hostname() != "github.com" {
-			return "", "", fmt.Errorf("only github.com is supported (remote host %q)", u.Hostname())
-		}
-		s = strings.TrimPrefix(u.Path, "/")
-	default:
-		return "", "", fmt.Errorf("unrecognized remote URL %q", remote)
+	form := url.Values{
+		"client_id":   {ClientID},
+		"device_code": {dc.DeviceCode},
+		"grant_type":  {"urn:ietf:params:oauth:grant-type:device_code"},
 	}
 
-	s = strings.TrimSuffix(s, ".git")
-	parts := strings.SplitN(s, "/", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return "", "", fmt.Errorf("could not parse owner/repo from remote %q", remote)
-	}
-	return parts[0], parts[1], nil
-}
-
-// do performs an API request, JSON-encoding body (if non-nil) and decoding the
-// response into out (if non-nil). Non-2xx responses become errors.
-func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
-	var reqBody io.Reader
-	if body != nil {
-		b, err := json.Marshal(body)
-		if err != nil {
-			return err
-		}
-		reqBody = bytes.NewReader(b)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, method, apiBase+path, reqBody)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	data, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		apiErr := &apiError{
-			StatusCode: resp.StatusCode,
-			msg:        fmt.Sprintf("GitHub API %s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(data))),
-		}
-		if resp.StatusCode == http.StatusUnauthorized {
-			return fmt.Errorf("%w: %w", ErrBadCredentials, apiErr)
-		}
-		if resp.StatusCode == http.StatusNotFound {
-			return fmt.Errorf("%w: %w", ErrNotFound, apiErr)
-		}
-		return apiErr
-	}
-	if out != nil {
-		if err := json.Unmarshal(data, out); err != nil {
-			return fmt.Errorf("decode %s response: %w", path, err)
-		}
-	}
-	return nil
-}
-
-func (c *Client) currentLogin(ctx context.Context) (string, error) {
-	var u struct {
-		Login string `json:"login"`
-	}
-	if err := c.do(ctx, http.MethodGet, "/user", nil, &u); err != nil {
-		return "", err
-	}
-	return u.Login, nil
-}
-
-// Label is a GitHub issue label.
-type Label struct {
-	Name string `json:"name"`
-}
-
-// User is a GitHub account.
-type User struct {
-	Login string `json:"login"`
-}
-
-// Issue is the subset of a GitHub issue nightshift cares about.
-type Issue struct {
-	Number    int       `json:"number"`
-	Title     string    `json:"title"`
-	URL       string    `json:"html_url"`
-	State     string    `json:"state"`
-	CreatedAt time.Time `json:"created_at"`
-	Body      string    `json:"body"`
-	Labels    []Label   `json:"labels"`
-	Assignees []User    `json:"assignees"`
-	// PullRequest is set by the API when this "issue" is actually a PR.
-	PullRequest *struct{} `json:"pull_request,omitempty"`
-}
-
-// IsPullRequest reports whether the API returned a pull request rather than a
-// plain issue (the /issues endpoint returns both).
-func (i Issue) IsPullRequest() bool { return i.PullRequest != nil }
-
-// LabelNames returns the issue's label names joined for display.
-func (i Issue) LabelNames() string {
-	names := make([]string, 0, len(i.Labels))
-	for _, l := range i.Labels {
-		names = append(names, l.Name)
-	}
-	return strings.Join(names, ", ")
-}
-
-// DefaultBranch returns the repository's default branch (e.g. main, develop).
-func (c *Client) DefaultBranch(ctx context.Context) (string, error) {
-	var r struct {
-		DefaultBranch string `json:"default_branch"`
-	}
-	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/%s", c.owner, c.repo), nil, &r); err != nil {
-		return "", err
-	}
-	return r.DefaultBranch, nil
-}
-
-// ListOptions filters which issues ListIssues returns. Empty fields impose no
-// filter on that dimension.
-type ListOptions struct {
-	Assignee string // "@me", a login, "*"/"none", or "" for any
-	Label    string
-	State    string // open, closed, all
-	Limit    int
-}
-
-// ListIssues returns issues matching opts in the client's repository.
-func (c *Client) ListIssues(ctx context.Context, opts ListOptions) ([]Issue, error) {
-	q := url.Values{}
-	if opts.State != "" {
-		q.Set("state", opts.State)
-	}
-	if opts.Label != "" {
-		q.Set("labels", opts.Label)
-	}
-	switch opts.Assignee {
-	case "":
-		// no assignee filter
-	case "@me":
-		q.Set("assignee", c.login)
-	default:
-		q.Set("assignee", opts.Assignee)
-	}
-	per := opts.Limit
-	if per <= 0 || per > 100 {
-		per = 100
-	}
-	q.Set("per_page", strconv.Itoa(per))
-
-	var issues []Issue
-	path := fmt.Sprintf("/repos/%s/%s/issues?%s", c.owner, c.repo, q.Encode())
-	if err := c.do(ctx, http.MethodGet, path, nil, &issues); err != nil {
-		return nil, err
-	}
-
-	// The /issues endpoint also returns pull requests; drop them and cap to Limit.
-	out := issues[:0]
-	for _, iss := range issues {
-		if iss.IsPullRequest() {
-			continue
-		}
-		out = append(out, iss)
-		if opts.Limit > 0 && len(out) >= opts.Limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-// GetIssue fetches a single issue by number.
-func (c *Client) GetIssue(ctx context.Context, number int) (Issue, error) {
-	var iss Issue
-	path := fmt.Sprintf("/repos/%s/%s/issues/%d", c.owner, c.repo, number)
-	if err := c.do(ctx, http.MethodGet, path, nil, &iss); err != nil {
-		return Issue{}, err
-	}
-	return iss, nil
-}
-
-// CreatePR opens a pull request and returns its HTML URL.
-func (c *Client) CreatePR(ctx context.Context, title, head, base, body string) (string, error) {
-	reqBody := map[string]any{
-		"title": title,
-		"head":  head,
-		"base":  base,
-		"body":  body,
-	}
-	var resp struct {
-		HTMLURL string `json:"html_url"`
-	}
-	path := fmt.Sprintf("/repos/%s/%s/pulls", c.owner, c.repo)
-
-	// GitHub occasionally can't see a just-pushed head ref yet and rejects the
-	// PR with 422 "not all refs are readable"; the ref becomes visible within a
-	// few seconds (more likely on large repos). Retry that transient case with
-	// backoff before giving up.
-	delay := prRetryDelay
-	for attempt := 0; ; attempt++ {
-		err := c.do(ctx, http.MethodPost, path, reqBody, &resp)
-		if err == nil {
-			return resp.HTMLURL, nil
-		}
-		if attempt >= 4 || !isRefsNotReadable(err) {
-			return "", err
-		}
+	for {
+		// Wait first: the user can't possibly have approved yet on the first pass.
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
-		case <-time.After(delay):
+			return Credentials{}, ctx.Err()
+		case <-time.After(interval):
 		}
-		delay *= 2
+		if time.Now().After(deadline) {
+			return Credentials{}, ErrCodeExpired
+		}
+
+		var tr tokenResponse
+		if err := postForm(ctx, "https://github.com/login/oauth/access_token", form, &tr); err != nil {
+			return Credentials{}, fmt.Errorf("poll for token: %w", err)
+		}
+
+		switch tr.Error {
+		case "":
+			return tr.credentials(time.Now()), nil
+		case "authorization_pending":
+			// The user hasn't finished yet; keep waiting.
+		case "slow_down":
+			interval = nextInterval(interval, tr.Interval)
+		case "expired_token", "token_expired":
+			return Credentials{}, ErrCodeExpired
+		case "access_denied":
+			return Credentials{}, ErrAccessDenied
+		case "device_flow_disabled":
+			return Credentials{}, ErrDeviceFlowDisabled
+		default:
+			return Credentials{}, fmt.Errorf("poll for token: %s: %s", tr.Error, tr.ErrorDescription)
+		}
 	}
 }
 
-// isRefsNotReadable reports whether err is the transient 422 GitHub returns when
-// a freshly-pushed ref isn't yet readable by the create-PR endpoint.
-func isRefsNotReadable(err error) bool {
-	var apiErr *apiError
-	return errors.As(err, &apiErr) &&
-		apiErr.StatusCode == http.StatusUnprocessableEntity &&
-		strings.Contains(apiErr.msg, "not all refs are readable")
+// nextInterval applies a slow_down: use GitHub's suggested interval if it
+// sent one, otherwise back off by the 5 seconds the spec mandates.
+func nextInterval(current time.Duration, suggestedSeconds int) time.Duration {
+	if s := time.Duration(suggestedSeconds) * time.Second; s > current {
+		return s
+	}
+	return current + 5*time.Second
 }
 
-// PullRequest is the subset of a PR nightshift needs to detect in-flight work.
-type PullRequest struct {
-	Number int    `json:"number"`
-	URL    string `json:"html_url"`
-	State  string `json:"state"`
-	Body   string `json:"body"`
-	Head   struct {
-		Ref string `json:"ref"`
-	} `json:"head"`
-}
-
-// ListOpenPRs returns the open pull requests in the repository (first 100).
-func (c *Client) ListOpenPRs(ctx context.Context) ([]PullRequest, error) {
-	var prs []PullRequest
-	path := fmt.Sprintf("/repos/%s/%s/pulls?state=open&per_page=100", c.owner, c.repo)
-	if err := c.do(ctx, http.MethodGet, path, nil, &prs); err != nil {
-		return nil, err
-	}
-	return prs, nil
-}
-
-// CommentOnIssue posts a comment on an issue.
-func (c *Client) CommentOnIssue(ctx context.Context, number int, body string) error {
-	reqBody := map[string]any{"body": body}
-	path := fmt.Sprintf("/repos/%s/%s/issues/%d/comments", c.owner, c.repo, number)
-	return c.do(ctx, http.MethodPost, path, reqBody, nil)
-}
-
-// AddLabels adds labels to an issue, leaving any existing labels in place. It is
-// a no-op when no labels are given. Adding a label already present is harmless.
-func (c *Client) AddLabels(ctx context.Context, number int, labels ...string) error {
-	if len(labels) == 0 {
-		return nil
-	}
-	reqBody := map[string]any{"labels": labels}
-	path := fmt.Sprintf("/repos/%s/%s/issues/%d/labels", c.owner, c.repo, number)
-	return c.do(ctx, http.MethodPost, path, reqBody, nil)
-}
-
-// RemoveLabel removes a single label from an issue. Removing a label the issue
-// does not have returns 404; that is treated as success so removal is
-// idempotent.
-func (c *Client) RemoveLabel(ctx context.Context, number int, label string) error {
-	path := fmt.Sprintf("/repos/%s/%s/issues/%d/labels/%s", c.owner, c.repo, number, url.PathEscape(label))
-	if err := c.do(ctx, http.MethodDelete, path, nil, nil); err != nil && !errors.Is(err, ErrNotFound) {
-		return err
-	}
-	return nil
-}
-
-// IssueUpdate names the fields UpdateIssue can change. Zero-valued fields are
-// omitted from the request, so only the fields you set are touched; a non-nil
-// (possibly empty) Labels slice replaces the issue's entire label set.
-type IssueUpdate struct {
-	State  string   // "open" or "closed"; "" leaves it unchanged
-	Title  string   // "" leaves it unchanged
-	Body   string   // "" leaves it unchanged
-	Labels []string // nil leaves labels unchanged; non-nil replaces them
-}
-
-// UpdateIssue patches an issue's state and/or fields. It is a no-op when update
-// names no fields.
-func (c *Client) UpdateIssue(ctx context.Context, number int, update IssueUpdate) error {
-	reqBody := map[string]any{}
-	if update.State != "" {
-		reqBody["state"] = update.State
-	}
-	if update.Title != "" {
-		reqBody["title"] = update.Title
-	}
-	if update.Body != "" {
-		reqBody["body"] = update.Body
-	}
-	if update.Labels != nil {
-		reqBody["labels"] = update.Labels
-	}
-	if len(reqBody) == 0 {
-		return nil
-	}
-	path := fmt.Sprintf("/repos/%s/%s/issues/%d", c.owner, c.repo, number)
-	return c.do(ctx, http.MethodPatch, path, reqBody, nil)
-}
+//// Package github talks to the GitHub REST API directly over net/http so
+//// nightshift needs no external CLI at runtime. Authentication uses a token from
+//// the GITHUB_TOKEN (or GH_TOKEN) environment variable. The repository is
+//// inferred from the origin remote of the working directory.
+//package github
+//
+//import (
+//	"bytes"
+//	"context"
+//	"encoding/json"
+//	"errors"
+//	"fmt"
+//	"io"
+//	"net/http"
+//	"net/url"
+//	"strconv"
+//	"strings"
+//	"time"
+//
+//	"github.com/birdbox/nightshift/internal/git"
+//)
+//
+////const (
+////	clientID = "Iv25liLyaM7ECgqD9CC4"
+////	slug     = "ticklish-llama"
+////)
+//
+//// apiBase is the GitHub REST API root. It is a var (not a const) only so tests
+//// can point the client at an httptest server.
+//var apiBase = "https://api.github.com"
+//
+//// prRetryDelay is the initial backoff between CreatePR retries; a var so tests
+//// can shrink it.
+//var prRetryDelay = time.Second
+//
+//// ErrBadCredentials wraps any API response that rejected the token (HTTP 401),
+//// i.e. the token is missing, invalid, expired, or revoked. Callers can detect
+//// it with errors.Is to re-prompt for a fresh token.
+//var ErrBadCredentials = errors.New("GitHub rejected the token (invalid, expired, or revoked)")
+//
+//// ErrNotFound wraps any API response that reported the resource as missing
+//// (HTTP 404). Callers can detect it with errors.Is to make removals idempotent.
+//var ErrNotFound = errors.New("GitHub returned 404 (resource not found)")
+//
+//// apiError carries the HTTP status of a failed API response so callers can act
+//// on a specific condition (e.g. retry a transient 422). Its message preserves
+//// the full formatted error including the response body.
+//type apiError struct {
+//	StatusCode int
+//	msg        string
+//}
+//
+//func (e *apiError) Error() string { return e.msg }
+//
+//// Client is an authenticated GitHub REST client scoped to one repository.
+//type Client struct {
+//	http  *http.Client
+//	token string
+//	owner string
+//	repo  string
+//	login string // authenticated user's login, used to resolve "@me"
+//}
+//
+//// NewClient builds a client for the repo whose origin remote lives in repoDir,
+//// using the given token, and verifies the token works by calling the API. If
+//// the token is rejected, the returned error wraps ErrBadCredentials.
+//func NewClient(ctx context.Context, repoDir, token string) (*Client, error) {
+//	if strings.TrimSpace(token) == "" {
+//		return nil, fmt.Errorf("empty GitHub token")
+//	}
+//
+//	remote, err := git.RemoteURL(ctx, repoDir, "origin")
+//	if err != nil {
+//		return nil, fmt.Errorf("read origin remote: %w", err)
+//	}
+//	owner, repo, err := parseSlug(remote)
+//	if err != nil {
+//		return nil, err
+//	}
+//
+//	c := &Client{
+//		http:  &http.Client{Timeout: 30 * time.Second},
+//		token: token,
+//		owner: owner,
+//		repo:  repo,
+//	}
+//
+//	login, err := c.currentLogin(ctx)
+//	if err != nil {
+//		return nil, fmt.Errorf("validate GitHub token: %w", err)
+//	}
+//	c.login = login
+//	return c, nil
+//}
+//
+//// Slug returns the "owner/name" of the client's repository.
+//func (c *Client) Slug() string { return c.owner + "/" + c.repo }
+//
+//// RepoSlug returns the owner and name of the repository whose origin remote
+//// lives in repoDir, without authenticating. It lets commands that only need the
+//// repo identity (not API access) avoid a token round-trip.
+//func RepoSlug(ctx context.Context, repoDir string) (owner, name string, err error) {
+//	remote, err := git.RemoteURL(ctx, repoDir, "origin")
+//	if err != nil {
+//		return "", "", fmt.Errorf("read origin remote: %w", err)
+//	}
+//	return parseSlug(remote)
+//}
+//
+//// parseSlug extracts owner/repo from an SSH or HTTPS GitHub remote URL.
+//func parseSlug(remote string) (owner, repo string, err error) {
+//	s := strings.TrimSpace(remote)
+//	switch {
+//	case strings.HasPrefix(s, "git@"):
+//		// scp-style: git@github.com:owner/repo.git
+//		at := strings.Index(s, "@")
+//		colon := strings.Index(s, ":")
+//		if colon < 0 {
+//			return "", "", fmt.Errorf("unrecognized remote URL %q", remote)
+//		}
+//		if host := s[at+1 : colon]; host != "github.com" {
+//			return "", "", fmt.Errorf("only github.com is supported (remote host %q)", host)
+//		}
+//		s = s[colon+1:]
+//	case strings.HasPrefix(s, "ssh://"), strings.HasPrefix(s, "https://"), strings.HasPrefix(s, "http://"):
+//		u, err := url.Parse(s)
+//		if err != nil {
+//			return "", "", fmt.Errorf("parse remote URL %q: %w", remote, err)
+//		}
+//		if u.Hostname() != "github.com" {
+//			return "", "", fmt.Errorf("only github.com is supported (remote host %q)", u.Hostname())
+//		}
+//		s = strings.TrimPrefix(u.Path, "/")
+//	default:
+//		return "", "", fmt.Errorf("unrecognized remote URL %q", remote)
+//	}
+//
+//	s = strings.TrimSuffix(s, ".git")
+//	parts := strings.SplitN(s, "/", 2)
+//	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+//		return "", "", fmt.Errorf("could not parse owner/repo from remote %q", remote)
+//	}
+//	return parts[0], parts[1], nil
+//}
+//
+//// do performs an API request, JSON-encoding body (if non-nil) and decoding the
+//// response into out (if non-nil). Non-2xx responses become errors.
+//func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
+//	var reqBody io.Reader
+//	if body != nil {
+//		b, err := json.Marshal(body)
+//		if err != nil {
+//			return err
+//		}
+//		reqBody = bytes.NewReader(b)
+//	}
+//
+//	req, err := http.NewRequestWithContext(ctx, method, apiBase+path, reqBody)
+//	if err != nil {
+//		return err
+//	}
+//	req.Header.Set("Authorization", "Bearer "+c.token)
+//	req.Header.Set("Accept", "application/vnd.github+json")
+//	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+//	if body != nil {
+//		req.Header.Set("Content-Type", "application/json")
+//	}
+//
+//	resp, err := c.http.Do(req)
+//	if err != nil {
+//		return err
+//	}
+//	defer resp.Body.Close()
+//
+//	data, _ := io.ReadAll(resp.Body)
+//	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+//		apiErr := &apiError{
+//			StatusCode: resp.StatusCode,
+//			msg:        fmt.Sprintf("GitHub API %s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(data))),
+//		}
+//		if resp.StatusCode == http.StatusUnauthorized {
+//			return fmt.Errorf("%w: %w", ErrBadCredentials, apiErr)
+//		}
+//		if resp.StatusCode == http.StatusNotFound {
+//			return fmt.Errorf("%w: %w", ErrNotFound, apiErr)
+//		}
+//		return apiErr
+//	}
+//	if out != nil {
+//		if err := json.Unmarshal(data, out); err != nil {
+//			return fmt.Errorf("decode %s response: %w", path, err)
+//		}
+//	}
+//	return nil
+//}
+//
+//func (c *Client) currentLogin(ctx context.Context) (string, error) {
+//	var u struct {
+//		Login string `json:"login"`
+//	}
+//	if err := c.do(ctx, http.MethodGet, "/user", nil, &u); err != nil {
+//		return "", err
+//	}
+//	return u.Login, nil
+//}
+//
+//// Label is a GitHub issue label.
+//type Label struct {
+//	Name string `json:"name"`
+//}
+//
+//// User is a GitHub account.
+//type User struct {
+//	Login string `json:"login"`
+//}
+//
+//// Issue is the subset of a GitHub issue nightshift cares about.
+//type Issue struct {
+//	Number    int       `json:"number"`
+//	Title     string    `json:"title"`
+//	URL       string    `json:"html_url"`
+//	State     string    `json:"state"`
+//	CreatedAt time.Time `json:"created_at"`
+//	Body      string    `json:"body"`
+//	Labels    []Label   `json:"labels"`
+//	Assignees []User    `json:"assignees"`
+//	// PullRequest is set by the API when this "issue" is actually a PR.
+//	PullRequest *struct{} `json:"pull_request,omitempty"`
+//}
+//
+//// IsPullRequest reports whether the API returned a pull request rather than a
+//// plain issue (the /issues endpoint returns both).
+//func (i Issue) IsPullRequest() bool { return i.PullRequest != nil }
+//
+//// LabelNames returns the issue's label names joined for display.
+//func (i Issue) LabelNames() string {
+//	names := make([]string, 0, len(i.Labels))
+//	for _, l := range i.Labels {
+//		names = append(names, l.Name)
+//	}
+//	return strings.Join(names, ", ")
+//}
+//
+//// DefaultBranch returns the repository's default branch (e.g. main, develop).
+//func (c *Client) DefaultBranch(ctx context.Context) (string, error) {
+//	var r struct {
+//		DefaultBranch string `json:"default_branch"`
+//	}
+//	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/%s", c.owner, c.repo), nil, &r); err != nil {
+//		return "", err
+//	}
+//	return r.DefaultBranch, nil
+//}
+//
+//// ListOptions filters which issues ListIssues returns. Empty fields impose no
+//// filter on that dimension.
+//type ListOptions struct {
+//	Assignee string // "@me", a login, "*"/"none", or "" for any
+//	Label    string
+//	State    string // open, closed, all
+//	Limit    int
+//}
+//
+//// ListIssues returns issues matching opts in the client's repository.
+//func (c *Client) ListIssues(ctx context.Context, opts ListOptions) ([]Issue, error) {
+//	q := url.Values{}
+//	if opts.State != "" {
+//		q.Set("state", opts.State)
+//	}
+//	if opts.Label != "" {
+//		q.Set("labels", opts.Label)
+//	}
+//	switch opts.Assignee {
+//	case "":
+//		// no assignee filter
+//	case "@me":
+//		q.Set("assignee", c.login)
+//	default:
+//		q.Set("assignee", opts.Assignee)
+//	}
+//	per := opts.Limit
+//	if per <= 0 || per > 100 {
+//		per = 100
+//	}
+//	q.Set("per_page", strconv.Itoa(per))
+//
+//	var issues []Issue
+//	path := fmt.Sprintf("/repos/%s/%s/issues?%s", c.owner, c.repo, q.Encode())
+//	if err := c.do(ctx, http.MethodGet, path, nil, &issues); err != nil {
+//		return nil, err
+//	}
+//
+//	// The /issues endpoint also returns pull requests; drop them and cap to Limit.
+//	out := issues[:0]
+//	for _, iss := range issues {
+//		if iss.IsPullRequest() {
+//			continue
+//		}
+//		out = append(out, iss)
+//		if opts.Limit > 0 && len(out) >= opts.Limit {
+//			break
+//		}
+//	}
+//	return out, nil
+//}
+//
+//// GetIssue fetches a single issue by number.
+//func (c *Client) GetIssue(ctx context.Context, number int) (Issue, error) {
+//	var iss Issue
+//	path := fmt.Sprintf("/repos/%s/%s/issues/%d", c.owner, c.repo, number)
+//	if err := c.do(ctx, http.MethodGet, path, nil, &iss); err != nil {
+//		return Issue{}, err
+//	}
+//	return iss, nil
+//}
+//
+//// CreatePR opens a pull request and returns its HTML URL.
+//func (c *Client) CreatePR(ctx context.Context, title, head, base, body string) (string, error) {
+//	reqBody := map[string]any{
+//		"title": title,
+//		"head":  head,
+//		"base":  base,
+//		"body":  body,
+//	}
+//	var resp struct {
+//		HTMLURL string `json:"html_url"`
+//	}
+//	path := fmt.Sprintf("/repos/%s/%s/pulls", c.owner, c.repo)
+//
+//	// GitHub occasionally can't see a just-pushed head ref yet and rejects the
+//	// PR with 422 "not all refs are readable"; the ref becomes visible within a
+//	// few seconds (more likely on large repos). Retry that transient case with
+//	// backoff before giving up.
+//	delay := prRetryDelay
+//	for attempt := 0; ; attempt++ {
+//		err := c.do(ctx, http.MethodPost, path, reqBody, &resp)
+//		if err == nil {
+//			return resp.HTMLURL, nil
+//		}
+//		if attempt >= 4 || !isRefsNotReadable(err) {
+//			return "", err
+//		}
+//		select {
+//		case <-ctx.Done():
+//			return "", ctx.Err()
+//		case <-time.After(delay):
+//		}
+//		delay *= 2
+//	}
+//}
+//
+//// isRefsNotReadable reports whether err is the transient 422 GitHub returns when
+//// a freshly-pushed ref isn't yet readable by the create-PR endpoint.
+//func isRefsNotReadable(err error) bool {
+//	var apiErr *apiError
+//	return errors.As(err, &apiErr) &&
+//		apiErr.StatusCode == http.StatusUnprocessableEntity &&
+//		strings.Contains(apiErr.msg, "not all refs are readable")
+//}
+//
+//// PullRequest is the subset of a PR nightshift needs to detect in-flight work.
+//type PullRequest struct {
+//	Number int    `json:"number"`
+//	URL    string `json:"html_url"`
+//	State  string `json:"state"`
+//	Body   string `json:"body"`
+//	Head   struct {
+//		Ref string `json:"ref"`
+//	} `json:"head"`
+//}
+//
+//// ListOpenPRs returns the open pull requests in the repository (first 100).
+//func (c *Client) ListOpenPRs(ctx context.Context) ([]PullRequest, error) {
+//	var prs []PullRequest
+//	path := fmt.Sprintf("/repos/%s/%s/pulls?state=open&per_page=100", c.owner, c.repo)
+//	if err := c.do(ctx, http.MethodGet, path, nil, &prs); err != nil {
+//		return nil, err
+//	}
+//	return prs, nil
+//}
+//
+//// CommentOnIssue posts a comment on an issue.
+//func (c *Client) CommentOnIssue(ctx context.Context, number int, body string) error {
+//	reqBody := map[string]any{"body": body}
+//	path := fmt.Sprintf("/repos/%s/%s/issues/%d/comments", c.owner, c.repo, number)
+//	return c.do(ctx, http.MethodPost, path, reqBody, nil)
+//}
+//
+//// AddLabels adds labels to an issue, leaving any existing labels in place. It is
+//// a no-op when no labels are given. Adding a label already present is harmless.
+//func (c *Client) AddLabels(ctx context.Context, number int, labels ...string) error {
+//	if len(labels) == 0 {
+//		return nil
+//	}
+//	reqBody := map[string]any{"labels": labels}
+//	path := fmt.Sprintf("/repos/%s/%s/issues/%d/labels", c.owner, c.repo, number)
+//	return c.do(ctx, http.MethodPost, path, reqBody, nil)
+//}
+//
+//// RemoveLabel removes a single label from an issue. Removing a label the issue
+//// does not have returns 404; that is treated as success so removal is
+//// idempotent.
+//func (c *Client) RemoveLabel(ctx context.Context, number int, label string) error {
+//	path := fmt.Sprintf("/repos/%s/%s/issues/%d/labels/%s", c.owner, c.repo, number, url.PathEscape(label))
+//	if err := c.do(ctx, http.MethodDelete, path, nil, nil); err != nil && !errors.Is(err, ErrNotFound) {
+//		return err
+//	}
+//	return nil
+//}
+//
+//// IssueUpdate names the fields UpdateIssue can change. Zero-valued fields are
+//// omitted from the request, so only the fields you set are touched; a non-nil
+//// (possibly empty) Labels slice replaces the issue's entire label set.
+//type IssueUpdate struct {
+//	State  string   // "open" or "closed"; "" leaves it unchanged
+//	Title  string   // "" leaves it unchanged
+//	Body   string   // "" leaves it unchanged
+//	Labels []string // nil leaves labels unchanged; non-nil replaces them
+//}
+//
+//// UpdateIssue patches an issue's state and/or fields. It is a no-op when update
+//// names no fields.
+//func (c *Client) UpdateIssue(ctx context.Context, number int, update IssueUpdate) error {
+//	reqBody := map[string]any{}
+//	if update.State != "" {
+//		reqBody["state"] = update.State
+//	}
+//	if update.Title != "" {
+//		reqBody["title"] = update.Title
+//	}
+//	if update.Body != "" {
+//		reqBody["body"] = update.Body
+//	}
+//	if update.Labels != nil {
+//		reqBody["labels"] = update.Labels
+//	}
+//	if len(reqBody) == 0 {
+//		return nil
+//	}
+//	path := fmt.Sprintf("/repos/%s/%s/issues/%d", c.owner, c.repo, number)
+//	return c.do(ctx, http.MethodPatch, path, reqBody, nil)
+//}

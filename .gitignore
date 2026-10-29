@@ -5,5 +5,11 @@
 *.test
 *.out
 
+# Environment file
+.env
+
+# Private keys
+*.pem
+
 # Editor/OS cruft
 .DS_Store
